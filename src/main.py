@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
 AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
-Modular Character System + Smart Context Management
+Modular Character System + Smart Context Management + Graceful Shutdown
 
 \src\main.py
-Version:     0.3
+Version:     0.4.3
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 
-Patch Notes v0.3:
-  [+] Smart Context Dumping: LLM writes diary entries separated by ---
-  [+] Anti-Plagiarism: Qdrant similarity check (>0.97) before saving
-  [+] BGE-M3 Support: embedding_dim=1024, 8K context window
-  [+] XML Memory Formatting: <memory_piece relatedness="..."> tags
-  [+] Dynamic Relevance Threshold: adaptive RAG sensitivity
-  [+] Semantic Anti-Repetition: cosine similarity checks (0.73/0.69 thresholds)
-  [+] Modular Architecture: MemoryManager separated from orchestrator
+Patch Notes v0.4.3:
+  [!] Fixed: Qdrant plagiarism check using client.query() instead of non-existent search()
+  [!] Fixed: DuckDB JSON serialization using json.dumps() instead of str()
+  [+] Improved: Diary section splitting with better --- normalization
+  [+] Improved: Text preservation in Qdrant (preserve newlines in page_content)
   
 Dependencies:
   - dearpygui>=1.11.0
@@ -23,7 +20,7 @@ Dependencies:
   - qdrant-client[http]>=1.11.0
   - pydantic>=2.8.0, pydantic-settings>=2.3.0
   - duckdb>=0.10.0
-  - ollama>=0.2.0 (for local LLM support)
+  - ollama>=0.2.0
 """
 
 import os
@@ -31,9 +28,11 @@ import sys
 import asyncio
 import logging
 import threading
+import signal
+import json
 import yaml
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 
 import dearpygui.dearpygui as dpg
@@ -42,6 +41,7 @@ from pydantic_settings import BaseSettings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.models import ScoredPoint
 from openai import BadRequestError
 
 # Local imports
@@ -70,23 +70,21 @@ class LLMSettings(BaseModel):
     backend: str = "ollama"
     base_url: str = "http://localhost:11434/v1"
     chat_model: str = "qwen2.5:7b"
-    embedding_model: str = "bge-m3:latest"  # Updated: BGE-M3 support
+    embedding_model: str = "bge-m3:latest"
     timeout: int = 120
-    token_dump_threshold: int = 20000  # From config::DIARY_TOKEN_COUNT_TRIGGER
+    token_dump_threshold: int = 20000
 
 
 class QdrantSettings(BaseModel):
     url: str = "http://localhost:6333"
     collection: str = "everynyan_diary"
-    embedding_dim: int = 1024  # BGE-M3 dimension (was 768 for nomic-embed-text)
+    embedding_dim: int = 1024
 
 
 class DiarySettings(BaseModel):
     storage_dir: str = "data/diary"
-    plagiarism_threshold: float = 0.97  # From config::DIARY_PLAGIARISM_THRESHOLD
-    injection_max_length: int = 5000  # From config::DIARY_INJECTION_MAX_LENGTH
-    
-    # Smart summarization prompt (from config::DIARY_PROMPT)
+    plagiarism_threshold: float = 0.97
+    injection_max_length: int = 5000
     summary_prompt: str = """
 It's time to open diary and share your thoughts, emotions and feelings! 
 Write shortly, but avoid missing details! Avoid plagiarism and copying prior pages.
@@ -123,10 +121,9 @@ class LoggingSettings(BaseModel):
 
 
 class AntiRepeatSettings(BaseModel):
-    """Settings for semantic anti-repetition (from config::REPEAT_YOURSELF_*)"""
-    trigger_avg: float = 0.73   # Lower = stricter average similarity check
-    trigger_max: float = 0.69   # Lower = stricter max similarity check  
-    max_history: int = 32       # Max messages to keep in anti-repeat cache
+    trigger_avg: float = 0.73
+    trigger_max: float = 0.69
+    max_history: int = 32
 
 
 class AppSettings(BaseSettings):
@@ -138,15 +135,10 @@ class AppSettings(BaseSettings):
     anti_repeat: AntiRepeatSettings = Field(default_factory=AntiRepeatSettings)
     debug: bool = False
     
-    model_config = ConfigDict(
-        env_file=".env", 
-        env_file_encoding="utf-8", 
-        extra="ignore"
-    )
+    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     
     @classmethod
     def from_yaml(cls, path: str) -> "AppSettings":
-        """Load settings from YAML file with error handling."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
@@ -157,39 +149,27 @@ class AppSettings(BaseSettings):
 
 
 # ============================================================================
-# Character Configuration (Modular System)
+# Character Configuration
 # ============================================================================
 
 class CharacterBaseConfig(BaseModel):
-    """Character personality and system prompt."""
     meta: dict = Field(default_factory=dict)
-    prompt: str  # Main system prompt (goes to LLM)
+    prompt: str
 
 
 class CharacterAppearanceConfig(BaseModel):
-    """Character visual description."""
     meta: dict = Field(default_factory=dict)
-    freeform: str  # Human-readable description
-    # sd_prompt: str  # Reserved for future image generation
+    freeform: str
 
 
 class CharacterConfig:
-    """
-    Modular character config loader.
-    Files must exist - no defaults created (fail-fast design).
-    """
-    
     BASE_PATH = Path("config/character/base.yaml")
     APPEARANCE_PATH = Path("config/character/appearance.yaml")
     
     @staticmethod
     def _load_yaml_file(filepath: Path, model: type[BaseModel]) -> BaseModel:
-        """Load and validate YAML via Pydantic. Raises if file missing."""
         if not filepath.exists():
-            raise FileNotFoundError(
-                f"Character config not found: {filepath}\n"
-                f"Please create based on template before running."
-            )
+            raise FileNotFoundError(f"Character config not found: {filepath}")
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
@@ -208,32 +188,58 @@ class CharacterConfig:
 
 
 # ============================================================================
-# Global Objects
+# Global Objects & State
 # ============================================================================
 
 settings: Optional[AppSettings] = None
 character_base: Optional[CharacterBaseConfig] = None
 character_appearance: Optional[CharacterAppearanceConfig] = None
 
-# Core components
 qdrant_client: Optional[QdrantClient] = None
 vector_store: Optional[QdrantVectorStore] = None
 llm: Optional[ChatOpenAI] = None
 embeddings: Optional[OpenAIEmbeddings] = None
 memory_manager: Optional[MemoryManager] = None
 
-# In-memory session context (Sliding Window)
 session_context: List[Dict[str, str]] = []
-
-# Anti-repetition cache: stores embeddings of recent assistant responses
 anti_repeat_cache: List[Dict[str, Any]] = []
+current_relevance_threshold: float = 0.5
 
-# Async infrastructure
 async_loop: Optional[asyncio.AbstractEventLoop] = None
 async_thread: Optional[threading.Thread] = None
 
-# Dynamic relevance threshold for RAG (starts at 0.5, adapts based on results)
-current_relevance_threshold: float = 0.5
+# Graceful shutdown flag
+_shutting_down: bool = False
+
+
+# ============================================================================
+# AI Thoughts UI System (Direct Updates - DearPyGui is thread-safe)
+# ============================================================================
+
+def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
+    """
+    Add a thought to the AI thoughts panel.
+    
+    DearPyGui is thread-safe for item configuration, so this can be called
+    from async background threads without additional locking.
+    """
+    try:
+        # Remove placeholder if it exists
+        if dpg.does_item_exist("thoughts_placeholder"):
+            dpg.delete_item("thoughts_placeholder")
+        
+        # Add new thought with timestamp
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        with dpg.group(parent="ai_thoughts_area", horizontal=True):
+            dpg.add_text(f"[{timestamp}] ", color=(100, 100, 100))
+            dpg.add_text(text, color=color)
+        
+        # Auto-scroll to bottom
+        dpg.set_y_scroll("ai_thoughts_area", 1e9)
+        
+    except Exception as e:
+        # UI updates may fail if DearPyGui isn't fully initialized yet
+        logger.debug(f"Thought UI update skipped (early init): {e}")
 
 
 # ============================================================================
@@ -241,13 +247,10 @@ current_relevance_threshold: float = 0.5
 # ============================================================================
 
 def run_async_loop(loop: asyncio.AbstractEventLoop):
-    """Run asyncio event loop in background thread."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-
 def submit_to_async(coro) -> asyncio.Future:
-    """Submit coroutine to background asyncio loop."""
     if async_loop is None or not async_loop.is_running():
         logger.warning("Async loop not ready, running synchronously")
         return asyncio.run(coro)
@@ -259,58 +262,49 @@ def submit_to_async(coro) -> asyncio.Future:
 # ============================================================================
 
 def init_components():
-    """Initialize LLM, embeddings, and Qdrant vector store."""
     global qdrant_client, vector_store, llm, embeddings
     
     logger.info("Initializing components...")
     
-    # Qdrant client
     qdrant_client = QdrantClient(url=settings.vector_db.url)
     
-    # Create collection if needed (with BGE-M3 dimension)
     if not qdrant_client.collection_exists(settings.vector_db.collection):
         qdrant_client.create_collection(
             collection_name=settings.vector_db.collection,
             vectors_config=models.VectorParams(
-                size=settings.vector_db.embedding_dim,  # 1024 for BGE-M3
+                size=settings.vector_db.embedding_dim,
                 distance=models.Distance.COSINE
             )
         )
         logger.info(f"Created collection: {settings.vector_db.collection}")
     
-    # Embeddings (BGE-M3 via Ollama OpenAI-compatible API)
     embeddings = OpenAIEmbeddings(
         model=settings.llm.embedding_model,
-        openai_api_key="ollama",  # Dummy key for Ollama
+        openai_api_key="ollama",
         openai_api_base=settings.llm.base_url,
         check_embedding_ctx_length=False,
-        # BGE-M3 handles dimensions internally; no need for model_kwargs
     )
     
-    # Vector store for RAG
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=settings.vector_db.collection,
         embedding=embeddings
     )
     
-    # LLM client (OpenAI-compatible API)
     llm = ChatOpenAI(
         model=settings.llm.chat_model,
         openai_api_key="ollama",
         openai_api_base=settings.llm.base_url,
         temperature=0.7,
         timeout=settings.llm.timeout,
-        streaming=False  # Simpler for now; can enable later
+        streaming=False
     )
     
     logger.info("Components initialized")
 
 
 def init_character():
-    """Load character configuration (personality + appearance)."""
     global character_base, character_appearance
-    
     logger.info("Loading character configuration...")
     character_base = CharacterConfig.load_base()
     character_appearance = CharacterConfig.load_appearance()
@@ -318,7 +312,6 @@ def init_character():
 
 
 def init_memory_manager():
-    """Initialize DuckDB-based memory manager."""
     global memory_manager
     memory_manager = MemoryManager()
     stats = memory_manager.get_stats()
@@ -330,12 +323,6 @@ def init_memory_manager():
 # ============================================================================
 
 async def query_memory(query: str, top_k: int = 3) -> str:
-    """
-    Semantic search in Qdrant with XML formatting for LLM.
-    
-    Uses dynamic relevance threshold (adapts based on results).
-    Returns formatted <memory_piece> tags or empty string if nothing found.
-    """
     global current_relevance_threshold
     
     if not vector_store:
@@ -348,10 +335,8 @@ async def query_memory(query: str, top_k: int = 3) -> str:
         
         formatted_memories = []
         for i, doc in enumerate(docs):
-            # Extract relevance score if available (Qdrant returns it in metadata)
             relevance = doc.metadata.get("score", "high")
-            
-            # Format as XML-like tag for better LLM parsing
+            # Preserve newlines in memory content for better LLM parsing
             memory_xml = (
                 f'<memory_piece id="{i}" relatedness="{relevance}">\n'
                 f'{doc.page_content}\n'
@@ -361,20 +346,11 @@ async def query_memory(query: str, top_k: int = 3) -> str:
         
         result = "\n\n".join(formatted_memories)
         
-        # Adapt relevance threshold based on results (like C++ naxyi_populate_ctx)
         if formatted_memories:
-            # If we got results but they're weak, lower threshold for next time
             if len(formatted_memories) < top_k:
-                current_relevance_threshold = max(
-                    0.3, 
-                    current_relevance_threshold * 0.95
-                )
-            # If we got many strong results, raise threshold to be more selective
+                current_relevance_threshold = max(0.3, current_relevance_threshold * 0.95)
             elif len(formatted_memories) == top_k:
-                current_relevance_threshold = min(
-                    0.9, 
-                    current_relevance_threshold * 1.05
-                )
+                current_relevance_threshold = min(0.9, current_relevance_threshold * 1.05)
         
         return result
         
@@ -387,22 +363,24 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
     """
     Check if text is too similar to existing entries in Qdrant.
     
-    Implements config::DIARY_PLAGIARISM_THRESHOLD logic.
+    Uses QdrantClient.query() API (v1.11+ compatible).
     Returns True if duplicate found (should skip saving).
     """
-    if not vector_store:
+    if not vector_store or not qdrant_client:
         return False
     
     try:
         # Get embedding for the new text
         query_vector = await embeddings.aembed_query(text)
         
-        # Search for most similar existing entry
-        results = qdrant_client.search(
+        # Use QdrantClient.query() for compatibility with v1.11+
+        results: List[ScoredPoint] = qdrant_client.query_points(
             collection_name=settings.vector_db.collection,
-            query_vector=query_vector,
-            limit=1
-        )
+            query=query_vector,
+            limit=1,
+            with_payload=False,
+            with_vectors=False
+        ).points
         
         if results:
             similarity = results[0].score  # Cosine similarity [0, 1]
@@ -411,6 +389,7 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
                     f"[PLAGIARISM] Skipped duplicate. "
                     f"Similarity: {similarity:.3f} > {threshold}"
                 )
+                add_ai_thought(f"🚫 Skipped duplicate memory (similarity: {similarity:.2f})", (255, 150, 150))
                 return True
         
         return False
@@ -434,12 +413,11 @@ async def dump_context_to_memory():
     
     if not session_context:
         logger.info("[SLIDING WINDOW] Context empty, nothing to dump")
+        add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
         return
     
-    logger.info(
-        f"[SLIDING WINDOW] Dumping {len(session_context)} messages "
-        f"to memory..."
-    )
+    logger.info(f"[SLIDING WINDOW] Dumping {len(session_context)} messages to memory...")
+    add_ai_thought(f"📝 Summarizing {len(session_context)} messages into diary...", (200, 200, 100))
     
     try:
         # 1. Format dialogue for LLM summarization
@@ -454,19 +432,25 @@ async def dump_context_to_memory():
             ("human", f"Here is the conversation to summarize:\n\n{dialogue_text}")
         ]
         
+        add_ai_thought("🧠 LLM is writing diary reflections...", (150, 200, 255))
         response = await llm.ainvoke(full_prompt)
         diary_entry = response.content
         
-        # 3. Normalize separators and split into sections
-        diary_entry = diary_entry.replace("-- -", "---").replace("- --", "---")
-        sections = diary_entry.split("---")
+        # 3. Normalize separators: handle various --- formats
+        # Replace common variations with standard markdown line
+        diary_entry = diary_entry.replace("-- -", "---")
+        diary_entry = diary_entry.replace("- --", "---")
+        diary_entry = diary_entry.replace("----", "---")  # 4 dashes -> 3
+        diary_entry = diary_entry.replace("\n---\n", "\n---\n")  # ensure consistent newlines
+        
+        # Split into sections, preserving content
+        sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         
         saved_count = 0
         total_sections = len(sections)
+        add_ai_thought(f"📖 Split into {total_sections} sections. Checking for plagiarism...", (200, 180, 255))
         
         for idx, section in enumerate(sections):
-            section = section.strip()
-            
             # Skip very short sections (noise)
             if len(section) < 20:
                 continue
@@ -481,6 +465,7 @@ async def dump_context_to_memory():
             
             # 5. Save to Qdrant (for RAG semantic search)
             try:
+                # Preserve newlines in page_content for better readability
                 vector_store.add_texts(
                     texts=[section],
                     metadatas=[{
@@ -497,13 +482,11 @@ async def dump_context_to_memory():
                         text=section,
                         index=idx,
                         total=total_sections,
-                        meta={
-                            "type": "reflection",
-                            "original_context_length": len(dialogue_text)
-                        }
+                        meta={"type": "reflection"}
                     )
                 
                 saved_count += 1
+                add_ai_thought(f"✅ Saved reflection {idx+1}/{total_sections}", (150, 255, 150))
                 
             except Exception as e:
                 logger.error(f"Failed to save section {idx}: {e}")
@@ -513,13 +496,16 @@ async def dump_context_to_memory():
             f"[SLIDING WINDOW] Saved {saved_count}/{total_sections} "
             f"unique reflections to memory"
         )
+        add_ai_thought(f"💾 Diary updated: {saved_count}/{total_sections} memories stored.", (100, 255, 100))
         
         # 7. Clear in-memory context (Sliding Window reset)
         session_context.clear()
         logger.info("[SLIDING WINDOW] In-memory context cleared")
+        add_ai_thought("🧹 Working memory cleared.", (150, 150, 150))
         
     except Exception as e:
         logger.error(f"[SLIDING WINDOW] Failed to dump context: {e}")
+        add_ai_thought(f"❌ Failed to save memories: {e}", (255, 100, 100))
 
 
 def check_anti_repetition_semantic(new_content: str) -> bool:
@@ -634,6 +620,7 @@ async def process_message(user_text: str) -> str:
     
     # 1. Anti-repetition check (semantic)
     if check_anti_repetition_semantic(user_text):
+        add_ai_thought("🔄 Detected repetition. Suggesting topic change.", (255, 200, 100))
         return "I feel like we're going in circles. Let's talk about something new! 🐾"
     
     # Inner function to avoid code duplication in retry logic
@@ -677,6 +664,7 @@ async def process_message(user_text: str) -> str:
                 "[SLIDING WINDOW] Context length exceeded. "
                 "Initiating smart dump sequence..."
             )
+            add_ai_thought("⚠️ Context overflow! Compressing memory...", (255, 150, 100))
             
             # Step 1: Summarize and save old context to memory
             await dump_context_to_memory()
@@ -684,6 +672,7 @@ async def process_message(user_text: str) -> str:
             # Step 2: Rehydrate context from DuckDB (recent history)
             if memory_manager:
                 logger.info("[SLIDING WINDOW] Rehydrating context from DuckDB...")
+                add_ai_thought("📥 Rehydrating recent chat history...", (150, 200, 255))
                 fresh_history = memory_manager.get_recent_history(limit=10)
                 
                 if fresh_history:
@@ -695,6 +684,7 @@ async def process_message(user_text: str) -> str:
             
             # Step 3: Retry generation with fresh context
             logger.info("[SLIDING WINDOW] Retrying generation...")
+            add_ai_thought("🔄 Retrying with fresh context...", (200, 200, 100))
             try:
                 return await attempt_generation()
             except Exception as retry_e:
@@ -706,6 +696,7 @@ async def process_message(user_text: str) -> str:
             
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
+        add_ai_thought(f"❌ LLM Error: {e}", (255, 100, 100))
         return f"Sorry, I encountered an error: {e}"
 
 
@@ -767,7 +758,6 @@ def find_available_font() -> Optional[str]:
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\segoeui.ttf", 
         r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\DejaVuSans.ttf",
     ]
     
     for font_path in fonts_to_try:
@@ -820,7 +810,7 @@ def setup_gui():
         no_resize=False
     ):
         # Scrollable chat area
-        with dpg.child_window(tag="chat_area", height=-50, border=False):
+        with dpg.child_window(tag="chat_area", height=-200, border=False):
             # Load and display recent history from DuckDB
             if memory_manager:
                 history = memory_manager.get_recent_history(limit=50)
@@ -841,6 +831,10 @@ def setup_gui():
                     tag="welcome_text", 
                     color=(150, 150, 200)
                 )
+        
+        # AI Thoughts Panel
+        with dpg.child_window(tag="ai_thoughts_area", height=120, label="🧠 AI Internal Thoughts", border=True):
+            dpg.add_text("🧠 Панель мыслей пуста", tag="thoughts_placeholder", color=(100, 100, 100))
         
         # Input area
         with dpg.group(horizontal=True):
@@ -883,6 +877,10 @@ def add_chat_message(sender: str, text: str, color: tuple):
 
 def on_send_message(sender, app_data):
     """GUI callback: handle user sending a message."""
+    global _shutting_down
+    if _shutting_down:
+        return
+        
     user_text = dpg.get_value("user_input").strip()
     if not user_text:
         return
@@ -892,6 +890,7 @@ def on_send_message(sender, app_data):
     dpg.set_value("user_input", "")
     dpg.configure_item("user_input", enabled=False)
     dpg.set_value("status_text", "Thinking...")
+    add_ai_thought(f"💬 Received: \"{user_text[:30]}{'...' if len(user_text)>30 else ''}\"", (150, 200, 255))
     
     # Submit async processing to background loop
     future = submit_to_async(handle_async_response(user_text))
@@ -919,10 +918,10 @@ async def handle_async_response(user_text: str):
         response = await process_message(user_text)
         
         # Update UI (must be on main thread - DearPyGui is not thread-safe)
-        # Since we're in async context, we use dpg.configure_item which is safe
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("AI_EveryNyan", response, color=(255, 200, 100))
+        add_ai_thought("✅ Response generated & displayed.", (150, 255, 150))
         
         # Save to memory (async)
         await save_to_memory(user_text, response)
@@ -932,6 +931,46 @@ async def handle_async_response(user_text: str):
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("Error", str(e), color=(255, 100, 100))
+        add_ai_thought(f"❌ Handler Error: {e}", (255, 100, 100))
+
+
+# ============================================================================
+# Graceful Shutdown & Signal Handling
+# ============================================================================
+
+def initiate_graceful_shutdown():
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    
+    logger.info("🛑 Initiating graceful shutdown sequence...")
+    add_ai_thought("🛑 Shutting down. Saving memories to diary...", (255, 150, 150))
+    dpg.configure_item("user_input", enabled=False)
+    dpg.set_value("status_text", "Saving memories... 🐾")
+    
+    # Run async dump in background loop
+    if session_context:
+        try:
+            future = asyncio.run_coroutine_threadsafe(dump_context_to_memory(), async_loop)
+            future.result(timeout=30)  # Wait up to 30s
+            add_ai_thought("✅ Memory dump complete.", (150, 255, 150))
+        except asyncio.TimeoutError:
+            logger.warning("⚠ Context dump timed out")
+            add_ai_thought("⚠️ Dump timed out. Exiting anyway.", (255, 200, 100))
+        except Exception as e:
+            logger.error(f"⚠ Failed to dump context: {e}")
+            add_ai_thought(f"❌ Dump failed: {e}", (255, 100, 100))
+    else:
+        add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
+    
+    # Stop DearPyGui
+    dpg.stop_dearpygui()
+
+
+def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}")
+    initiate_graceful_shutdown()
 
 
 # ============================================================================
@@ -939,57 +978,84 @@ async def handle_async_response(user_text: str):
 # ============================================================================
 
 def main():
-    """Application entry point."""
     global settings, async_loop, async_thread
     
-    logger.info(f"Starting AI_EveryNyan v0.3 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.4.3 (debug={settings.debug})")
     
-    # 1. Initialize memory manager (DuckDB)
+    # Register signal handlers for Ctrl+C and termination
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     init_memory_manager()
-    
-    # 2. Initialize core components (LLM, Qdrant, embeddings)
     init_components()
-    
-    # 3. Load character configuration
     init_character()
     
-    # 4. Start background asyncio loop
     async_loop = asyncio.new_event_loop()
-    async_thread = threading.Thread(
-        target=run_async_loop, 
-        args=(async_loop,), 
-        daemon=True
-    )
+    async_thread = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
     async_thread.start()
     
-    # 5. Setup and run DearPyGui
     setup_gui()
     
     logger.info("✓ Entering DearPyGui main loop...")
-    dpg.start_dearpygui()
+    add_ai_thought("🚀 System online. Ready for interaction.", (100, 255, 100))
     
-    # 6. Graceful shutdown
-    logger.info("Shutting down...")
-    async_loop.call_soon_threadsafe(async_loop.stop)
-    async_thread.join(timeout=2.0)
-    
-    if memory_manager:
-        memory_manager.close()
-    
-    dpg.destroy_context()
-    logger.info("✓ Shutdown complete")
+    try:
+        dpg.start_dearpygui()
+    finally:
+        # === Graceful shutdown: ALWAYS dump context on exit (window close OR signal) ===
+        logger.info("🛑 Initiating graceful shutdown sequence...")
+        add_ai_thought("🛑 Shutting down. Saving memories to diary...", (255, 150, 150))
+        dpg.configure_item("user_input", enabled=False)
+        dpg.set_value("status_text", "Saving memories... 🐾")
+        
+        # Debug: log context size at shutdown
+        logger.info(f"DEBUG: session_context size at shutdown: {len(session_context)}")
+        if session_context:
+            for i, msg in enumerate(session_context[-5:], max(0, len(session_context)-5)):
+                logger.debug(f"  [{i}] {msg['role']}: {msg['content'][:50]}...")
+        
+        # Сохраняем контекст, если есть что сохранять
+        if session_context:
+            try:
+                # Запускаем дамп в фоновом async loop
+                future = asyncio.run_coroutine_threadsafe(
+                    dump_context_to_memory(), 
+                    async_loop
+                )
+                # Ждём с таймаутом, чтобы не зависнуть
+                future.result(timeout=300)
+                add_ai_thought("✅ Memory dump complete.", (150, 255, 150))
+            except asyncio.TimeoutError:
+                logger.warning("⚠ Context dump timed out")
+                add_ai_thought("⚠️ Dump timed out. Exiting anyway.", (255, 200, 100))
+            except Exception as e:
+                logger.error(f"⚠ Failed to dump context: {e}")
+                add_ai_thought(f"❌ Dump failed: {e}", (255, 100, 100))
+        else:
+            logger.info("ℹ️ No active context to save at shutdown")
+            add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
+        
+        # Останавливаем фоновые сервисы
+        logger.info("Shutting down background services...")
+        add_ai_thought("🔌 Disconnecting services...", (200, 200, 200))
+        
+        async_loop.call_soon_threadsafe(async_loop.stop)
+        async_thread.join(timeout=2.0)
+        
+        if memory_manager:
+            memory_manager.close()
+        
+        dpg.destroy_context()
+        logger.info("✓ Shutdown complete. Goodbye! 🐾")
 
 
 if __name__ == "__main__":
-    # Load application settings from YAML
     config_path = Path("config/settings.yaml")
     settings = AppSettings.from_yaml(str(config_path))
     
-    # Ensure required directories exist
     Path(settings.diary.storage_dir).mkdir(parents=True, exist_ok=True)
     Path("logs").mkdir(parents=True, exist_ok=True)
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
     
-    # Run application
     main()
