@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
     Установщик AI_EveryNyan (плоская структура).
-    Создает Conda-окружение, устанавливает зависимости, генерирует конфиги.
-    Идмпотентен: безопасен для повторного запуска.
+    Создает Conda-окружение, устанавливает зависимости, скачивает bge-m3 в Ollama, генерирует конфиги.
+    Идемпотентен: безопасен для повторного запуска.
 #>
 
 # === Настройка кодировки ===
@@ -62,18 +62,20 @@ function New-SettingsExample {
     param([string]$OutPath)
     $Content = @"
 # AI_EveryNyan Configuration Template
+# NOTE: bge-m3 использует 1024-мерные вектора и контекст до 8192 токенов
+
 llm:
   backend: "ollama"
   base_url: "http://localhost:11434/v1"
   chat_model: "qwen2.5:7b"
-  embedding_model: "nomic-embed-text"
+  embedding_model: "bge-m3"        # ← Установлен автоматически инсталлятором
   timeout: 60
 
 vector_db:
   mode: "docker"
   url: "http://localhost:6333"
   collection_name: "everynyan_diary"
-  embedding_dim: 768
+  embedding_dim: 1024              # ← ВАЖНО: bge-m3 = 1024 (не 768!)
   min_relevance: 0.5
 
 diary:
@@ -105,21 +107,22 @@ Write-Status "║  AI_EveryNyan Installer                ║" "INFO"
 Write-Status "╚════════════════════════════════════════╝" "INFO"
 
 # 1. Проверка зависимостей
-Write-Status "[1/5] Проверка системных зависимостей..." "INFO"
+Write-Status "[1/6] Проверка системных зависимостей..." "INFO"
 $Missing = @()
 if (!(Test-Command "git")) { $Missing += "Git" }
 if (!(Test-Command "conda")) { $Missing += "Conda (Miniforge/Anaconda)" }
 if (!(Test-Command "docker")) { $Missing += "Docker" }
+if (!(Test-Command "ollama")) { $Missing += "Ollama" }
 
 if ($Missing.Count -gt 0) {
     Write-Status "ОШИБКА: Отсутствуют: $($Missing -join ', ')" "ERROR"
     Read-Host "Нажмите Enter для выхода"
     exit 1
 }
-Write-Status "  [+] Git, Conda, Docker найдены" "SUCCESS"
+Write-Status "  [+] Git, Conda, Docker, Ollama найдены" "SUCCESS"
 
 # 2. Создание структуры папок
-Write-Status "`n[2/5] Создание структуры проекта..." "INFO"
+Write-Status "`n[2/6] Создание структуры проекта..." "INFO"
 $Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage")
 foreach ($dir in $Dirs) {
     if (!(Test-Path $dir)) {
@@ -129,7 +132,7 @@ foreach ($dir in $Dirs) {
 Write-Status "  [+] Директории готовы" "SUCCESS"
 
 # 3. Шаблоны конфигов
-Write-Status "`n[3/5] Подготовка конфигурации..." "INFO"
+Write-Status "`n[3/6] Подготовка конфигурации..." "INFO"
 $SettingsExample = Join-Path $ConfigPath "settings.yaml.example"
 $SettingsActual = Join-Path $ConfigPath "settings.yaml"
 
@@ -143,8 +146,35 @@ if (!(Test-Path $SettingsActual)) {
     Write-Status "  [+] config/settings.yaml уже существует" "INFO"
 }
 
-# 4. Conda-окружение + pip install
-Write-Status "`n[4/5] Настройка Python-окружения..." "INFO"
+# 4. Установка Ollama-модели bge-m3
+Write-Status "`n[4/6] Проверка embedding-модели bge-m3..." "INFO"
+
+$modelInstalled = $false
+try {
+    $ollamaList = & ollama list 2>$null
+    if ($ollamaList -match "bge-m3") {
+        $modelInstalled = $true
+    }
+} catch {}
+
+if ($modelInstalled) {
+    Write-Status "  [+] bge-m3 уже установлена в Ollama" "SUCCESS"
+} else {
+    Write-Status "  Скачивание bge-m3 (~1.2 GB)..." "INFO"
+    $pullOk = Invoke-WithRetry -Script {
+        & ollama pull bge-m3
+        if ($LASTEXITCODE -ne 0) { throw "ollama pull failed" }
+    } -MaxAttempts 3 -DelaySec 10
+
+    if ($pullOk) {
+        Write-Status "  [+] bge-m3 успешно установлена" "SUCCESS"
+    } else {
+        Write-Status "  [!] Не удалось скачать bge-m3. Запустите вручную: ollama pull bge-m3" "WARN"
+    }
+}
+
+# 5. Conda-окружение + pip install
+Write-Status "`n[5/6] Настройка Python-окружения..." "INFO"
 
 if (!(Test-Path $EnvPath)) {
     Write-Status "  Создание Conda env: $EnvPath" "INFO"
@@ -171,8 +201,8 @@ if (Test-Path $ReqFile) {
     Write-Status "  [!] requirements.txt не найден в корне" "WARN"
 }
 
-# 5. Проверка импортов
-Write-Status "`n[5/5] Проверка критических импортов..." "INFO"
+# 6. Проверка импортов
+Write-Status "`n[6/6] Проверка критических импортов..." "INFO"
 $Modules = @("dearpygui.dearpygui", "langchain_core", "qdrant_client", "pydantic", "asyncio")
 $AllOK = $true
 foreach ($mod in $Modules) {
@@ -196,11 +226,11 @@ Write-Status "" "INFO"
 Write-Status "Следующие шаги:" "INFO"
 Write-Status "  1. Убедитесь, что внешние запускаторы (run_ai_everynyan.bat, run_qdrant.bat) присутствуют в корне проекта" "INFO"
 Write-Status "  2. Запустите Qdrant (если используется Docker-режим)" "INFO"
-Write-Status "  3. Запустите Ollama (при необходимости)" "INFO"
+Write-Status "  3. Запустите Ollama (если еще не запущен)" "INFO"
 Write-Status "  4. Запустите приложение через run_ai_everynyan.bat" "INFO"
 Write-Status "" "INFO"
 Write-Status "Конфиг: $ConfigPath\settings.yaml" "INFO"
-Write-Status "Логи: $LogsPath\install.log" "INFO"
+Write-Status "Логи:   $LogsPath\install.log" "INFO"
 
 Read-Host "`nНажмите Enter для завершения"
 exit 0
