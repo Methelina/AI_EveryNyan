@@ -1,0 +1,31 @@
+# AI_EveryNyan Configuration Template
+llm:
+  backend: "ollama"
+  base_url: "http://localhost:11434/v1"
+  chat_model: "qwen2.5:7b"
+  embedding_model: "nomic-embed-text"
+  timeout: 60
+
+vector_db:
+  mode: "docker"
+  url: "http://localhost:6333"
+  collection_name: "everynyan_diary"
+  embedding_dim: 768
+  min_relevance: 0.5
+
+diary:
+  storage_dir: "data/diary"
+  token_dump_threshold: 8000
+  plagiarism_threshold: 0.85
+
+gui:
+  title: "AI_EveryNyan"
+  width: 900
+  height: 700
+  theme: "dark"
+
+logging:
+  level: "INFO"
+  file: "logs/app.log"
+
+debug: false

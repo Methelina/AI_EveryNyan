@@ -2,18 +2,16 @@
 chcp 65001 >nul
 title AI_EveryNyan Chat
 
+:: === Paths ===
 set "ROOT=%~dp0"
-set "PROJECT=%ROOT%AI_EveryNyan"
-set "ENV=%PROJECT%\env"
-set "CONFIG=%PROJECT%\config"
-set "DATA=%PROJECT%\data"
+set "ENV=%ROOT%env"
+set "CONFIG=%ROOT%config"
+set "DATA=%ROOT%data"
 
-:: Env vars
+:: === Environment ===
 set "HF_HOME=%ROOT%hf_cache"
 set "QDRANT_URL=http://localhost:6333"
 set "PYTHONUNBUFFERED=1"
-
-:: DearPyGui HiDPI fix
 set "QT_AUTO_SCREEN_SCALE_FACTOR=0"
 set "QT_SCALE_FACTOR=1"
 
@@ -23,6 +21,6 @@ if not exist "%ENV%\python.exe" (
     exit /b 1
 )
 
-cd /d "%PROJECT%"
+cd /d "%ROOT%"
 "%ENV%\python.exe" src/main.py --config "%CONFIG%\settings.yaml" --data-dir "%DATA%"
 pause

@@ -1,57 +1,80 @@
 <#
 .SYNOPSIS
-    Минимальный установщик AI_EveryNyan.
-    Стек: DearPyGui + LangChain + Qdrant(Docker) + Pydantic
-    Без Telegram, SD, vLLM.
+    Установщик AI_EveryNyan (плоская структура).
+    Создает Conda-окружение, устанавливает зависимости, генерирует конфиги и запускаторы.
+    Идмпотентен: безопасен для повторного запуска.
 #>
 
+# === Настройка кодировки ===
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-# === Конфигурация ===
-$ProjectName = "AI_EveryNyan"
+# === Конфигурация путей ===
+$ProjectRoot = $PSScriptRoot
 $PythonVersion = "3.11"
-$ScriptDir = $PSScriptRoot
-$InstallPath = Join-Path $ScriptDir $ProjectName
-$EnvPath = Join-Path $InstallPath "env"
-$DataPath = Join-Path $InstallPath "data"
-$ConfigPath = Join-Path $InstallPath "config"
+$EnvPath = Join-Path $ProjectRoot "env"
+$PythonExe = Join-Path $EnvPath "python.exe"
+$ConfigPath = Join-Path $ProjectRoot "config"
+$SrcPath = Join-Path $ProjectRoot "src"
+$DataPath = Join-Path $ProjectRoot "data"
+$LogsPath = Join-Path $ProjectRoot "logs"
+$CachePath = Join-Path $ProjectRoot "hf_cache"
+$TempPath = Join-Path $ProjectRoot "temp"
+$ReqFile = Join-Path $ProjectRoot "requirements.txt"
 
-# === Функции ===
+# === Вспомогательные функции ===
 
-function Write-Header {
-    Write-Host ""
-    Write-Host "╔════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║  AI_EveryNyan Minimal Installer        ║" -ForegroundColor Cyan
-    Write-Host "║  DearPyGui • LangChain • Qdrant        ║" -ForegroundColor Cyan
-    Write-Host "╚════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
+function Write-Status {
+    param([string]$Message, [string]$Level = "INFO")
+    $color = switch ($Level) {
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default   { "White" }
+    }
+    Write-Host "[$Level] $Message" -ForegroundColor $color
+    $logLine = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    if (!(Test-Path $LogsPath)) { New-Item -ItemType Directory -Path $LogsPath -Force | Out-Null }
+    Add-Content -Path (Join-Path $LogsPath "install.log") -Value $logLine -Encoding UTF8
 }
 
 function Test-Command {
-    param([string]$Command)
-    return $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
+    param([string]$Cmd)
+    return $null -ne (Get-Command $Cmd -ErrorAction SilentlyContinue)
+}
+
+function Invoke-WithRetry {
+    param([scriptblock]$Script, [int]$MaxAttempts = 3, [int]$DelaySec = 5)
+    $attempt = 0
+    while ($attempt -lt $MaxAttempts) {
+        try {
+            & $Script
+            if ($LASTEXITCODE -eq 0) { return $true }
+        } catch {}
+        $attempt++
+        if ($attempt -ge $MaxAttempts) { return $false }
+        Start-Sleep -Seconds $DelaySec
+    }
+    return $false
 }
 
 function New-LauncherBat {
-    param([string]$FilePath)
+    param([string]$OutPath)
     $BatContent = @"
 @echo off
 chcp 65001 >nul
 title AI_EveryNyan Chat
 
+:: === Paths ===
 set "ROOT=%~dp0"
-set "PROJECT=%ROOT%AI_EveryNyan"
-set "ENV=%PROJECT%\env"
-set "CONFIG=%PROJECT%\config"
-set "DATA=%PROJECT%\data"
+set "ENV=%ROOT%env"
+set "CONFIG=%ROOT%config"
+set "DATA=%ROOT%data"
 
-:: Env vars
+:: === Environment ===
 set "HF_HOME=%ROOT%hf_cache"
 set "QDRANT_URL=http://localhost:6333"
 set "PYTHONUNBUFFERED=1"
-
-:: DearPyGui HiDPI fix
 set "QT_AUTO_SCREEN_SCALE_FACTOR=0"
 set "QT_SCALE_FACTOR=1"
 
@@ -61,19 +84,19 @@ if not exist "%ENV%\python.exe" (
     exit /b 1
 )
 
-cd /d "%PROJECT%"
+cd /d "%ROOT%"
 "%ENV%\python.exe" src/main.py --config "%CONFIG%\settings.yaml" --data-dir "%DATA%"
 pause
 "@
     $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($FilePath, $BatContent, $Utf8NoBom)
-    Write-Host "  [+] Created: $FilePath" -ForegroundColor Green
+    [System.IO.File]::WriteAllText($OutPath, $BatContent, $Utf8NoBom)
+    Write-Status "Создан запускатор: $OutPath" "SUCCESS"
 }
 
-function New-SettingsYaml {
-    param([string]$OutputPath)
+function New-SettingsExample {
+    param([string]$OutPath)
     $Content = @"
-# AI_EveryNyan Minimal Config
+# AI_EveryNyan Configuration Template
 llm:
   backend: "ollama"
   base_url: "http://localhost:11434/v1"
@@ -106,140 +129,116 @@ logging:
 debug: false
 "@
     $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($OutputPath, $Content, $Utf8NoBom)
-    Write-Host "  [+] Created: $OutputPath" -ForegroundColor Green
+    [System.IO.File]::WriteAllText($OutPath, $Content, $Utf8NoBom)
+    Write-Status "Создан шаблон: $OutPath" "SUCCESS"
 }
 
 # === Основной процесс ===
 
-Write-Header
+Write-Status "╔════════════════════════════════════════╗" "INFO"
+Write-Status "║  AI_EveryNyan Installer                ║" "INFO"
+Write-Status "╚════════════════════════════════════════╝" "INFO"
 
-# [1/5] Проверка зависимостей
-Write-Host "[1/5] Checking system dependencies..." -ForegroundColor Yellow
+# 1. Проверка зависимостей
+Write-Status "[1/6] Проверка системных зависимостей..." "INFO"
 $Missing = @()
 if (!(Test-Command "git")) { $Missing += "Git" }
-if (!(Test-Command "conda")) { $Missing += "Conda" }
+if (!(Test-Command "conda")) { $Missing += "Conda (Miniforge/Anaconda)" }
 if (!(Test-Command "docker")) { $Missing += "Docker" }
 
 if ($Missing.Count -gt 0) {
-    Write-Host "ERROR: Missing: $($Missing -join ', ')" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
+    Write-Status "ОШИБКА: Отсутствуют: $($Missing -join ', ')" "ERROR"
+    Read-Host "Нажмите Enter для выхода"
     exit 1
 }
-Write-Host "  [+] Git, Conda, Docker found" -ForegroundColor Green
+Write-Status "  [+] Git, Conda, Docker найдены" "SUCCESS"
 
-# [2/5] Создание структуры папок
-Write-Host "`n[2/5] Creating project structure..." -ForegroundColor Yellow
-@"
-data/diary
-data/qdrant_storage
-config
-logs
-hf_cache
-temp
-src
-"@ -split "`n" | ForEach-Object {
-    $dir = Join-Path $InstallPath $_.Trim()
+# 2. Создание структуры папок
+Write-Status "`n[2/6] Создание структуры проекта..." "INFO"
+$Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage")
+foreach ($dir in $Dirs) {
     if (!(Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 }
-Write-Host "  [+] Directories created" -ForegroundColor Green
+Write-Status "  [+] Директории готовы" "SUCCESS"
 
-# [3/5] Подготовка исходников
-Write-Host "`n[3/5] Preparing source code..." -ForegroundColor Yellow
-$SrcPath = Join-Path $InstallPath "src"
-if (!(Test-Path (Join-Path $SrcPath "main.py"))) {
-    $Stub = @"
-# AI_EveryNyan Minimal Entry Point
-import os, sys, time
+# 3. Шаблоны конфигов
+Write-Status "`n[3/6] Подготовка конфигурации..." "INFO"
+$SettingsExample = Join-Path $ConfigPath "settings.yaml.example"
+$SettingsActual = Join-Path $ConfigPath "settings.yaml"
 
-def main():
-    print("AI_EveryNyan starting...")
-    print("Qdrant URL:", os.getenv("QDRANT_URL", "http://localhost:6333"))
-    print("Press Ctrl+C to exit")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Shutting down...")
-
-if __name__ == "__main__":
-    main()
-"@
-    New-Item -ItemType File -Path (Join-Path $SrcPath "main.py") -Value $Stub -Force | Out-Null
-    Write-Host "  [+] Created stub src/main.py" -ForegroundColor Green
+if (!(Test-Path $SettingsExample)) {
+    New-SettingsExample -OutPath $SettingsExample
+}
+if (!(Test-Path $SettingsActual)) {
+    Copy-Item $SettingsExample $SettingsActual
+    Write-Status "  [+] Создан config/settings.yaml (отредактируйте под себя)" "INFO"
 } else {
-    Write-Host "  [+] src/main.py already exists" -ForegroundColor Gray
+    Write-Status "  [+] config/settings.yaml уже существует" "INFO"
 }
 
-# [4/5] Создание окружения + установка зависимостей
-Write-Host "`n[4/5] Setting up Python environment..." -ForegroundColor Yellow
-
-$PythonExe = Join-Path $EnvPath "python.exe"
+# 4. Conda-окружение + pip install
+Write-Status "`n[4/6] Настройка Python-окружения..." "INFO"
 
 if (!(Test-Path $EnvPath)) {
-    Write-Host "  Creating Conda env: $EnvPath" -ForegroundColor Gray
-    conda create --prefix $EnvPath python=$PythonVersion pip -y -q
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "ERROR: Failed to create Conda env" -ForegroundColor Red
+    Write-Status "  Создание Conda env: $EnvPath" "INFO"
+    $createOk = Invoke-WithRetry {
+        conda create --prefix $EnvPath python=$PythonVersion pip -y -q
+        if ($LASTEXITCODE -ne 0) { throw "conda create failed" }
+    }
+    if (!$createOk) {
+        Write-Status "ОШИБКА: Не удалось создать окружение" "ERROR"
         exit 1
     }
 }
 
-Write-Host "  Installing requirements..." -ForegroundColor Gray
-$ReqFile = Join-Path $ScriptDir "requirements.txt"
+# Установка зависимостей
 if (Test-Path $ReqFile) {
-    & $PythonExe -m pip install -r $ReqFile
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "WARN: pip install completed with warnings" -ForegroundColor Yellow
+    Write-Status "  Установка requirements..." "INFO"
+    $pipOk = Invoke-WithRetry {
+        & $PythonExe -m pip install -r $ReqFile
+        if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
     }
+    if ($pipOk) { Write-Status "  [+] Зависимости установлены" "SUCCESS" }
+    else { Write-Status "  [!] Предупреждение при pip install" "WARN" }
+} else {
+    Write-Status "  [!] requirements.txt не найден в корне" "WARN"
 }
 
-# Пост-проверка импортов (ИСПРАВЛЕНО: по одному модулю, через полный путь к python.exe)
-Write-Host "  Verifying critical imports..." -ForegroundColor Gray
-$Imports = @(
-    "dearpygui.dearpygui",
-    "langchain_core", 
-    "qdrant_client", 
-    "pydantic", 
-    "asyncio"
-)
+# 5. Проверка импортов
+Write-Status "`n[5/6] Проверка критических импортов..." "INFO"
+$Modules = @("dearpygui.dearpygui", "langchain_core", "qdrant_client", "pydantic", "asyncio")
 $AllOK = $true
-foreach ($imp in $Imports) {
-    & $PythonExe -c "import $imp" 2>$null
+foreach ($mod in $Modules) {
+    & $PythonExe -c "import $mod" 2>$null
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "    [+] $imp" -ForegroundColor Green
+        Write-Status "    [+] $mod" "SUCCESS"
     } else {
-        Write-Host "    [!] $imp FAILED" -ForegroundColor Yellow
+        Write-Status "    [!] $mod НЕ НАЙДЕН" "ERROR"
         $AllOK = $false
     }
 }
-if ($AllOK) {
-    Write-Host "  [+] All imports successful" -ForegroundColor Green
-} else {
-    Write-Host "  [!] Some imports failed - check errors above" -ForegroundColor Yellow
-}
+if ($AllOK) { Write-Status "  [+] Все импорты успешны" "SUCCESS" }
+else { Write-Status "  [!] Ошибка импорта. Проверьте логи или переустановите окружение." "ERROR" }
 
-# [5/5] Генерация конфига + запускатора
-Write-Host "`n[5/5] Generating config and launcher..." -ForegroundColor Yellow
-
-if (!(Test-Path (Join-Path $ConfigPath "settings.yaml"))) {
-    New-SettingsYaml -OutputPath (Join-Path $ConfigPath "settings.yaml")
-}
-New-LauncherBat -FilePath (Join-Path $ScriptDir "run_ai_everynyan.bat")
+# 6. Генерация запускатора
+Write-Status "`n[6/6] Создание запускатора..." "INFO"
+New-LauncherBat -OutPath (Join-Path $ProjectRoot "run_ai_everynyan.bat")
 
 # === Финал ===
-Write-Host ""
-Write-Host "╔════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║   Installation complete!               ║" -ForegroundColor Green
-Write-Host "╚════════════════════════════════════════╝" -ForegroundColor Green
-Write-Host ""
-Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  1. Start Qdrant:  .\run_qdrant.bat" -ForegroundColor White
-Write-Host "  2. Ensure Ollama is running (if using ollama backend)" -ForegroundColor Gray
-Write-Host "  3. Launch app:    .\run_ai_everynyan.bat" -ForegroundColor White
-Write-Host ""
-Write-Host "Config: $ConfigPath\settings.yaml" -ForegroundColor Gray
-Write-Host "Python: $PythonExe" -ForegroundColor Gray
-Read-Host "Press Enter to finish"
+Write-Status "" "INFO"
+Write-Status "╔════════════════════════════════════════╗" "SUCCESS"
+Write-Status "║   Установка завершена!                 ║" "SUCCESS"
+Write-Status "╚════════════════════════════════════════╝" "SUCCESS"
+Write-Status "" "INFO"
+Write-Status "Следующие шаги:" "INFO"
+Write-Status "  1. Запустите Qdrant: .\run_qdrant.bat" "INFO"
+Write-Status "  2. Убедитесь, что Ollama запущен (если используется)" "INFO"
+Write-Status "  3. Запустите приложение: .\run_ai_everynyan.bat" "INFO"
+Write-Status "" "INFO"
+Write-Status "Конфиг: $ConfigPath\settings.yaml" "INFO"
+Write-Status "Логи: $LogsPath\install.log" "INFO"
+
+Read-Host "`nНажмите Enter для завершения"
+exit 0

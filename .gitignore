@@ -1,0 +1,41 @@
+# === Python / Build ===
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# === Environments ===
+env/
+venv/
+.venv/
+ENV/
+
+# === Runtime Data (Generated, Heavy, Personal) ===
+data/
+logs/
+hf_cache/
+temp/
+
+# === Configs & Secrets ===
+config/settings.yaml
+.env
+.env.local
+.secrets
+
+# === IDE & OS ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Root Safety ===
+*.log
+*.tmp
+nohup.out
+*.pid
