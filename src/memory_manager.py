@@ -4,15 +4,17 @@ Uses DuckDB for structured chat history and Qdrant for semantic RAG memory.
 Provides Sliding Window mechanism and smart context dumping.
 
 \src\memory_manager.py
-Version:     0.3.1
+Version:     0.3.2
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 Changes:
-  - Fixed DuckDB schema: indexes created separately (not inline in CREATE TABLE)
-  - Added error handling for DB initialization
+  - Fixed: JSON serialization for DuckDB metadata (json.dumps instead of str)
+  - Fixed: Proper handling of None metadata values
+  - Added: Input validation for diary summaries
 """
 
 import duckdb
+import json
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -54,7 +56,6 @@ class MemoryManager:
         self.conn = duckdb.connect(self._db_path)
         
         # Chat history table (for Sliding Window)
-        # Note: DuckDB doesn't support inline INDEX in CREATE TABLE
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id BIGINT PRIMARY KEY,
@@ -106,10 +107,12 @@ class MemoryManager:
         """
         try:
             unique_id = int(datetime.now().timestamp() * 1e9)
+            # Proper JSON serialization for DuckDB
+            meta_json = json.dumps(meta, ensure_ascii=False) if meta else None
             self.conn.execute("""
                 INSERT INTO chat_history (id, role, content, metadata, session_id)
                 VALUES (?, ?, ?, ?, ?)
-            """, [unique_id, role, content, str(meta) if meta else None, session_id])
+            """, [unique_id, role, content, meta_json, session_id])
             self.conn.commit()
             logger.debug(f"Saved {role} message ({len(content)} chars) to history")
             return True
@@ -132,11 +135,19 @@ class MemoryManager:
             True if saved successfully, False on error
         """
         try:
+            # Validate input
+            if not text or len(text.strip()) < 10:
+                logger.warning("Skipping empty or too short diary summary")
+                return False
+            
             unique_id = int(datetime.now().timestamp() * 1e9)
+            # Proper JSON serialization for DuckDB (double quotes, not single)
+            meta_json = json.dumps(meta, ensure_ascii=False) if meta else None
+            
             self.conn.execute("""
                 INSERT INTO diary_summaries (id, summary_text, section_index, total_sections, metadata)
                 VALUES (?, ?, ?, ?, ?)
-            """, [unique_id, text, index, total, str(meta) if meta else None])
+            """, [unique_id, text, index, total, meta_json])
             self.conn.commit()
             logger.debug(f"Saved diary summary {index+1}/{total} ({len(text)} chars)")
             return True
@@ -228,7 +239,7 @@ class MemoryManager:
                 {
                     "text": text,
                     "section": f"{idx+1}/{total}",
-                    "metadata": meta,
+                    "metadata": json.loads(meta) if meta else {},
                     "timestamp": ts
                 }
                 for text, idx, total, meta, ts in result
