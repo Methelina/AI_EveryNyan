@@ -1,13 +1,13 @@
 # 🐱 AI_EveryNyan — пока только Qdrant и каркас
 
-Haro, EveryNyan! I Wish i were a bird!
+Haro, EveryNyan! I Wish i were a bird!  
 Пока проект в процессе: **основной запускатор (`run_ai_everynyan.bat`) — заглушка** (GUI ещё не готов),  
 но векторная база Qdrant уже работает, и окружение поднимается на ура.
 
 ## 📦 Что нужно для старта
 
-- **Conda** (Miniforge или Anaconda)  
-- **Docker** (чтобы запустить Qdrant)  
+- **Conda** (Miniforge или Anaconda)
+- **Docker** (чтобы запустить Qdrant)
 - **Git** (для клонирования, если ещё нет)
 
 ## 🚀 Установка (один раз)
@@ -22,6 +22,7 @@ Haro, EveryNyan! I Wish i were a bird!
 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
 
 Скрипт сделает всё сам:
+
 - создаст окружение `env` (Python 3.11)
 - установит зависимости из `requirements.txt`
 - сгенерирует папки: `config`, `data`, `logs`, `hf_cache`, `src`, `temp`
@@ -39,32 +40,31 @@ AI_EveryNyan/
 ├── logs/              # логи установки и приложения
 ├── hf_cache/          # кэш Hugging Face (опционально)
 ├── run_ai_everynyan.bat   # ⚠️ заглушка (основной код ещё не доделан)
+├── run_qdrant.bat          # ✅ готовый запуск Qdrant через Docker
 └── install_ai_everynyan.ps1
 ```
 
 ## ▶️ Порядок запуска (что работает уже сейчас)
 
 1. **Запустите Qdrant** (векторная БД)  
-   Установщик не создаёт `run_qdrant.bat` автоматически, но вы можете запустить Qdrant вручную:
-
-   ```bash
-   docker run -p 6333:6333 -v ${PWD}/data/qdrant_storage:/qdrant/storage qdrant/qdrant
-   ```
-
-   Или создайте свой `run_qdrant.bat` с этой командой.
-
+  Просто кликните `run_qdrant.bat` — он сам проверит Docker, создаст контейнер `ai_everynyan-qdrant`, смонтирует папку `data\qdrant_storage` и откроет порты.  
+  После запуска Qdrant будет доступен по адресу:
+  
+  - API: `http://localhost:6333`
+  - Веб-интерфейс: `http://localhost:6333/dashboard/`
 2. **Настройте `config/settings.yaml`**  
-   Укажите:
-   - `backend: "ollama"` (или другой)
-   - `base_url` и модели для чата и эмбеддингов
-   - `vector_db.url: "http://localhost:6333"`
-
+  Укажите:
+  
+  - `backend: "ollama"` (или другой)
+  - `base_url` и модели для чата и эмбеддингов
+  - `vector_db.url: "http://localhost:6333"`
 3. **Убедитесь, что Ollama запущен** (если используете его)  
-   `ollama serve` в отдельном окне.
-
+  `ollama serve` в отдельном окне.
+  
 4. **Пока основное приложение — заглушка**  
-   `run_ai_everynyan.bat` выведет сообщение о том, что код в разработке.  
-   Реальная логика появится позже.
+  `run_ai_everynyan.bat` выведет сообщение, что код в разработке.  
+  Реальная логика появится позже.
+  
 
 ## 🤔 Что не работает?
 
@@ -81,3 +81,7 @@ AI_EveryNyan/
 
 Следите за обновлениями — скоро появится настоящий GUI и логика работы с дневником.  
 А пока можно спокойно поднимать инфраструктуру и ждать :)
+
+---
+
+Готово — теперь в README честно сказано про `run_qdrant.bat`, и он упомянут в структуре. Мяу 😺
