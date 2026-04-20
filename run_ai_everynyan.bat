@@ -2,16 +2,18 @@
 chcp 65001 >nul
 title AI_EveryNyan Chat
 
-:: === Paths ===
+:: === Пути (плоская структура) ===
 set "ROOT=%~dp0"
 set "ENV=%ROOT%env"
 set "CONFIG=%ROOT%config"
 set "DATA=%ROOT%data"
 
-:: === Environment ===
+:: === Переменные окружения ===
 set "HF_HOME=%ROOT%hf_cache"
 set "QDRANT_URL=http://localhost:6333"
 set "PYTHONUNBUFFERED=1"
+
+:: === Fix для HiDPI в DearPyGui ===
 set "QT_AUTO_SCREEN_SCALE_FACTOR=0"
 set "QT_SCALE_FACTOR=1"
 
