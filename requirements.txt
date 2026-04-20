@@ -2,6 +2,9 @@
 aiohttp>=3.9.0
 httpx>=0.27.0
 
+# === Local Analytics DB (for conversation history & RAG context) ===
+duckdb>=1.5.0
+
 # === LangChain + Qdrant RAG ===
 langchain>=0.2.0
 langchain-core>=0.2.0

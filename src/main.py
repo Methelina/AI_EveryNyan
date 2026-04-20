@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + Modular Character System
+AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History + Modular Character System
 """
 import os
 import sys
@@ -8,8 +8,10 @@ import asyncio
 import logging
 import threading
 import yaml
+import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
 import dearpygui.dearpygui as dpg
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
@@ -17,6 +19,10 @@ from pydantic_settings import BaseSettings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
+from openai import BadRequestError
+
+# Локальный импорт менеджера памяти
+from memory_manager import MemoryManager
 
 # === Настройка логирования ===
 logging.basicConfig(
@@ -38,6 +44,7 @@ class LLMSettings(BaseModel):
     chat_model: str = "qwen2.5:7b"
     embedding_model: str = "nomic-embed-text"
     timeout: int = 60
+    token_dump_threshold: int = 4000  # Порог сброса контекста в память
 
 
 class QdrantSettings(BaseModel):
@@ -48,7 +55,6 @@ class QdrantSettings(BaseModel):
 
 class DiarySettings(BaseModel):
     storage_dir: str = "data/diary"
-    token_dump_threshold: int = 8000
     plagiarism_threshold: float = 0.85
 
 
@@ -76,7 +82,6 @@ class AppSettings(BaseSettings):
     
     @classmethod
     def from_yaml(cls, path: str) -> "AppSettings":
-        """Загрузка настроек из YAML-файла"""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
@@ -86,69 +91,39 @@ class AppSettings(BaseSettings):
             raise
 
 
-# === Конфигурация персонажа (модульная система) ===
+# === Конфигурация персонажа ===
 
 class CharacterBaseConfig(BaseModel):
-    """
-    Личность и системный промпт персонажа.
-    Файл: config/character/base.yaml
-    """
     meta: dict = Field(default_factory=dict)
-    prompt: str  # Основной системный промпт (попадает в LLM)
-
+    prompt: str
 
 class CharacterAppearanceConfig(BaseModel):
-    """
-    Визуальное описание персонажа.
-    Файл: config/character/appearance.yaml
-    """
     meta: dict = Field(default_factory=dict)
-    freeform: str  # Описание для человека / контекста
-    # sd_prompt: str  # Зарезервировано для будущей генерации изображений
-
+    freeform: str
 
 class CharacterConfig:
-    """
-    Модульная система загрузки конфигурации персонажа.
-    Если файлы отсутствуют — выбрасывается ошибка (не создаются дефолты).
-    """
-    
     BASE_PATH = Path("config/character/base.yaml")
     APPEARANCE_PATH = Path("config/character/appearance.yaml")
     
     @staticmethod
     def _load_yaml_file(filepath: Path, model: type[BaseModel]) -> BaseModel:
-        """Загружает и валидирует YAML-файл через Pydantic."""
         if not filepath.exists():
-            raise FileNotFoundError(
-                f"Character config file not found: {filepath}\n"
-                f"Please create it based on the template before running the application."
-            )
-        
+            raise FileNotFoundError(f"Character config file not found: {filepath}")
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             return model.model_validate(data)
-        except yaml.YAMLError as e:
-            logger.error(f"YAML parsing error in {filepath}: {e}")
-            raise
-        except ValidationError as e:
-            logger.error(f"Validation error in {filepath}: {e}")
+        except Exception as e:
+            logger.error(f"Error loading {filepath}: {e}")
             raise
     
     @classmethod
     def load_base(cls) -> CharacterBaseConfig:
-        """Загружает конфигурацию личности персонажа."""
-        config = cls._load_yaml_file(cls.BASE_PATH, CharacterBaseConfig)
-        logger.info(f"Loaded character base: {cls.BASE_PATH}")
-        return config
+        return cls._load_yaml_file(cls.BASE_PATH, CharacterBaseConfig)
     
     @classmethod
     def load_appearance(cls) -> CharacterAppearanceConfig:
-        """Загружает визуальное описание персонажа."""
-        config = cls._load_yaml_file(cls.APPEARANCE_PATH, CharacterAppearanceConfig)
-        logger.info(f"Loaded character appearance: {cls.APPEARANCE_PATH}")
-        return config
+        return cls._load_yaml_file(cls.APPEARANCE_PATH, CharacterAppearanceConfig)
 
 
 # === Глобальные объекты ===
@@ -160,20 +135,21 @@ qdrant_client: Optional[QdrantClient] = None
 vector_store: Optional[QdrantVectorStore] = None
 llm: Optional[ChatOpenAI] = None
 embeddings: Optional[OpenAIEmbeddings] = None
+memory_manager: Optional[MemoryManager] = None
 
-# === Async loop в отдельном потоке ===
+# In-memory контекст сессии (список сообщений)
+session_context: List[Dict[str, str]] = []
+
+# Async loop
 async_loop: Optional[asyncio.AbstractEventLoop] = None
 async_thread: Optional[threading.Thread] = None
 
 
 def run_async_loop(loop: asyncio.AbstractEventLoop):
-    """Запускает event loop в фоновом потоке"""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-
 def submit_to_async(coro) -> asyncio.Future:
-    """Отправляет корутину в фоновый asyncio-поток"""
     if async_loop is None or not async_loop.is_running():
         logger.warning("Async loop not ready, running synchronously")
         return asyncio.run(coro)
@@ -183,12 +159,10 @@ def submit_to_async(coro) -> asyncio.Future:
 # === Инициализация компонентов ===
 
 def init_components():
-    """Инициализация всех сервисов: Qdrant, LLM, Embeddings"""
     global qdrant_client, vector_store, llm, embeddings
     
     logger.info("Initializing components...")
     
-    # Qdrant client
     qdrant_client = QdrantClient(url=settings.vector_db.url)
     
     if not qdrant_client.collection_exists(settings.vector_db.collection):
@@ -201,7 +175,6 @@ def init_components():
         )
         logger.info(f"Created collection: {settings.vector_db.collection}")
     
-    # Embeddings
     embeddings = OpenAIEmbeddings(
         model=settings.llm.embedding_model,
         openai_api_key="ollama",
@@ -214,14 +187,12 @@ def init_components():
         )
     )
     
-    # Vector store
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=settings.vector_db.collection,
         embedding=embeddings
     )
     
-    # LLM
     llm = ChatOpenAI(
         model=settings.llm.chat_model,
         openai_api_key="ollama",
@@ -235,52 +206,98 @@ def init_components():
 
 
 def init_character():
-    """Загрузка конфигурации персонажа (модульная, с валидацией)"""
     global character_base, character_appearance
-    
     logger.info("Loading character configuration...")
-    
-    # Загружаем файлы — ошибка выбрасывается, если не найдены
     character_base = CharacterConfig.load_base()
     character_appearance = CharacterConfig.load_appearance()
-    
-    # Отладочное сообщение об успешной загрузке
     logger.info("Character brain loaded correctly. All systems nominal")
 
 
-# === RAG: поиск в памяти ===
+def init_memory_manager():
+    global memory_manager
+    memory_manager = MemoryManager()
+    stats = memory_manager.get_stats()
+    logger.info(f"MemoryManager initialized. Total messages: {stats['total_messages']}")
+
+
+# === RAG и Управление Контекстом ===
 
 async def query_memory(query: str, top_k: int = 3) -> str:
-    """Семантический поиск в Qdrant + форматирование результата"""
+    """Семантический поиск в Qdrant с форматированием в XML"""
     if not vector_store:
         return ""
     
     try:
         docs = await vector_store.asimilarity_search(query, k=top_k)
         if not docs:
-            return "No relevant memories found."
+            return ""
         
-        result = "\n\n".join([
-            f"[{i+1}] {doc.page_content}" 
-            for i, doc in enumerate(docs)
-        ])
-        return f"<retrieved_memories>\n{result}\n</retrieved_memories>"
+        formatted_memories = []
+        for i, doc in enumerate(docs):
+            # Форматируем как XML для лучшего понимания LLM
+            memory_xml = (
+                f'<memory_piece id="{i}" relatedness="high">\n'
+                f'{doc.page_content}\n'
+                f'</memory_piece>'
+            )
+            formatted_memories.append(memory_xml)
+            
+        return "\n\n".join(formatted_memories)
     except Exception as e:
         logger.error(f"Memory query failed: {e}")
-        return f"Error retrieving memories: {e}"
+        return ""
 
 
-# === Формирование системного промпта ===
+async def dump_context_to_memory():
+    """Сжимает текущий контекст сессии и сохраняет в Qdrant/DuckDB как одну запись"""
+    global session_context
+    
+    if not session_context:
+        return
+        
+    logger.info("Context overflow detected. Dumping to memory...")
+    
+    try:
+        # Формируем текст для суммаризации
+        context_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in session_context])
+        
+        # Простая суммаризация через LLM (можно улучшить)
+        summary_prompt = f"Summarize the following conversation into key facts and emotional states in 2-3 sentences:\n\n{context_text}"
+        summary_response = await llm.ainvoke([("human", summary_prompt)])
+        summary = summary_response.content
+        
+        # Сохраняем резюме в Qdrant (RAG)
+        if vector_store:
+            vector_store.add_texts(
+                texts=[f"[Session Summary] {summary}"],
+                metadatas=[{"type": "summary", "timestamp": datetime.now().isoformat()}]
+            )
+        
+        # Сохраняем полный лог в DuckDB (если нужно, но обычно там уже есть отдельные сообщения)
+        # Здесь мы просто очищаем in-memory контекст, так как отдельные сообщения уже сохранены в handle_async_response
+        
+        session_context.clear()
+        logger.info("Context dumped and cleared.")
+        
+    except Exception as e:
+        logger.error(f"Failed to dump context: {e}")
+
+
+def check_anti_repetition(new_message: str, history: List[Dict], threshold: float = 0.9) -> bool:
+    """Простая проверка на точное совпадение последних ответов"""
+    if not history:
+        return False
+    last_assistant_msg = next((msg['content'] for msg in reversed(history) if msg['role'] == 'assistant'), None)
+    if last_assistant_msg and new_message.strip() == last_assistant_msg.strip():
+        return True
+    return False
+
+
+# === Обработка сообщений ===
 
 def build_system_prompt() -> str:
-    """
-    Собирает финальный системный промпт из:
-    - личности персонажа (base.yaml)
-    - визуального описания (appearance.yaml)
-    - инструкций по использованию памяти
-    """
     if not character_base or not character_appearance:
-        raise RuntimeError("Character config not loaded")
+        return "You are a helpful assistant."
     
     return f"""{character_base.prompt}
 
@@ -289,95 +306,122 @@ def build_system_prompt() -> str:
 </visual_reference>
 
 <instructions>
-- Use retrieved memories if they are relevant to the user's query.
+- Use retrieved memories if they are relevant.
 - Be concise, friendly, and stay in character.
-- Do not invent facts. If unsure, ask for clarification.
-- When referring to yourself, use the name and pronouns defined in your base prompt.
+- Do not invent facts.
 </instructions>"""
 
 
-# === Обработка сообщения пользователя ===
-
 async def process_message(user_text: str) -> str:
-    """Основной цикл: память → промпт → LLM → ответ"""
+    """Основной цикл обработки"""
+    global session_context
     
-    # 1. Поиск релевантных записей в памяти
-    memory_context = await query_memory(user_text)
+    # 1. Проверка на повтор
+    if check_anti_repetition(user_text, session_context):
+        return "I feel like we're going in circles. Let's talk about something else! 🐾"
+
+    # 2. Поиск в памяти (RAG)
+    rag_context = await query_memory(user_text)
     
-    # 2. Формирование промпта
+    # 3. Формирование промпта
     system_prompt = build_system_prompt()
-    user_prompt = f"{memory_context}\n\nUser: {user_text}\nAI:"
     
-    # 3. Запрос к LLM
+    # Собираем сообщения для LLM: System + Session Context + RAG + Current User Message
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Добавляем RAG контекст, если есть
+    if rag_context:
+        messages.append({
+            "role": "system", 
+            "content": f"<retrieved_memories>\n{rag_context}\n</retrieved_memories>"
+        })
+        
+    # Добавляем историю сессии (последние N сообщений)
+    # Ограничиваем, чтобы не превысить контекстное окно слишком быстро
+    max_history_len = 10
+    recent_history = session_context[-max_history_len:] if len(session_context) > max_history_len else session_context
+    messages.extend(recent_history)
+    
+    # Добавляем текущее сообщение пользователя
+    messages.append({"role": "user", "content": user_text})
+    
+    # 4. Запрос к LLM
     try:
-        response = await llm.ainvoke([
-            ("system", system_prompt),
-            ("human", user_prompt)
-        ])
-        return response.content
+        response = await llm.ainvoke(messages)
+        ai_response = response.content
+        
+        # Проверяем использование токенов (если доступно)
+        # В LangChain/OpenAI это зависит от провайдера. Для Ollama может потребоваться парсинг заголовков или отдельный запрос.
+        # Пока просто сохраняем.
+        
+        return ai_response
+        
+    except BadRequestError as e:
+        if "context length" in str(e).lower():
+            logger.warning("Context length exceeded. Triggering dump.")
+            await dump_context_to_memory()
+            return "My memory was getting full, so I organized my thoughts. Please ask again!"
+        raise
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
         return f"Sorry, I encountered an error: {e}"
 
 
-# === Сохранение диалога в память ===
-
 async def save_to_memory(user_text: str, ai_response: str):
-    """Сохраняет диалог в Qdrant для будущего RAG"""
-    if not vector_store or not embeddings:
-        return
+    """Сохранение в DuckDB и Qdrant"""
+    global session_context
     
-    try:
-        content = f"User: {user_text}\nAI: {ai_response}"
-        vector_store.add_texts(
-            texts=[content],
-            metadatas=[{"type": "dialogue", "timestamp": str(Path.cwd())}]
-        )
-        logger.debug("Saved dialogue to memory")
-    except Exception as e:
-        logger.warning(f"Failed to save to memory: {e}")
+    # Сохраняем в DuckDB (история)
+    if memory_manager:
+        memory_manager.save_message("user", user_text)
+        memory_manager.save_message("assistant", ai_response)
+        
+    # Добавляем в in-memory контекст
+    session_context.append({"role": "user", "content": user_text})
+    session_context.append({"role": "assistant", "content": ai_response})
+    
+    # Сохраняем в Qdrant (для RAG)
+    # Обрезаем если слишком длинно для эмбеддинга
+    content = f"User: {user_text}\nAI: {ai_response}"
+    max_chars = 2000
+    if len(content) > max_chars:
+        content = content[:max_chars] + "..."
+        
+    if vector_store:
+        try:
+            vector_store.add_texts(
+                texts=[content],
+                metadatas=[{"type": "dialogue", "timestamp": datetime.now().isoformat()}]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save to Qdrant: {e}")
 
 
-# === DearPyGui: GUI логика ===
+# === GUI Логика ===
 
 def find_available_font():
-    """
-    Ищет первый доступный шрифт из списка предпочтений.
-    Возвращает путь к шрифту или None если ни один не найден.
-    """
     fonts_to_try = [
         r"C:\Windows\Fonts\JetBrainsMono Nerd Font.ttf",
-        r"C:\Windows\Fonts\JetBrainsMonoNL-Regular.ttf", 
-        r"C:\Windows\Fonts\consola.ttf",           # Consolas
-        r"C:\Windows\Fonts\segoeui.ttf",           # Segoe UI
-        r"C:\Windows\Fonts\arial.ttf",             # Arial
-        r"C:\Windows\Fonts\DejaVuSans.ttf",        # DejaVu Sans (если установлен)
+        r"C:\Windows\Fonts\consola.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
     ]
-    
     for font_path in fonts_to_try:
         if Path(font_path).exists():
-            logger.info(f"Using font: {font_path}")
             return font_path
-    
-    logger.warning("No preferred fonts found, using default DearPyGui font")
     return None
 
-
 def setup_gui():
-    """Инициализация интерфейса DearPyGui"""
     dpg.create_context()
     
-    # Настройка шрифта с поддержкой кириллицы
+    # Шрифт
     font_path = find_available_font()
     if font_path:
         with dpg.font_registry():
             with dpg.font(font_path, 16) as main_font:
-                # Добавляем поддержку кириллицы и расширенных символов
-                dpg.add_font_range_hint(dpg.mvFontRangeHint_Cyrillic)
-                dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
-        
+                pass # Автодиапазоны в новых версиях DPG
         dpg.bind_font(main_font)
-        logger.info("Font with Cyrillic support loaded successfully")
+        logger.info(f"Font loaded: {font_path}")
     
     dpg.create_viewport(
         title=settings.gui.title,
@@ -386,7 +430,6 @@ def setup_gui():
         resizable=True
     )
     
-    # Тема
     if settings.gui.theme == "dark":
         with dpg.theme() as dark_theme:
             with dpg.theme_component(dpg.mvAll):
@@ -398,7 +441,21 @@ def setup_gui():
     
     with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False):
         with dpg.child_window(tag="chat_area", height=-50, border=False):
-            dpg.add_text("Welcome to AI_EveryNyan! Type a message below.", tag="welcome_text", color=(150, 150, 200))
+            # Загрузка истории из DuckDB
+            if memory_manager:
+                history = memory_manager.get_recent_history(limit=50)
+                for msg in history:
+                    color = (100, 200, 255) if msg['role'] == 'user' else (255, 200, 100)
+                    sender = "You" if msg['role'] == 'user' else "AI_EveryNyan"
+                    with dpg.group(parent="chat_area", horizontal=False):
+                        with dpg.group(horizontal=True):
+                            dpg.add_text(f"{sender}:", color=color)
+                        with dpg.group(indent=20):
+                            wrap_width = max(200, dpg.get_viewport_width() - 150)
+                            dpg.add_text(msg['content'], wrap=wrap_width)
+                        dpg.add_spacer(height=5)
+            else:
+                dpg.add_text("Welcome to AI_EveryNyan!", tag="welcome_text", color=(150, 150, 200))
         
         with dpg.group(horizontal=True):
             dpg.add_input_text(
@@ -417,9 +474,7 @@ def setup_gui():
 
 
 def add_chat_message(sender: str, text: str, color: tuple):
-    """Добавление сообщения в интерфейс чата (только из главного потока!)"""
     dpg.set_y_scroll("chat_area", 1e9)
-    
     with dpg.group(parent="chat_area", horizontal=False):
         with dpg.group(horizontal=True):
             dpg.add_text(f"{sender}:", color=color)
@@ -427,12 +482,10 @@ def add_chat_message(sender: str, text: str, color: tuple):
             wrap_width = max(200, dpg.get_viewport_width() - 150)
             dpg.add_text(text, wrap=wrap_width)
         dpg.add_spacer(height=5)
-    
     dpg.set_y_scroll("chat_area", 1e9)
 
 
 def on_send_message(sender, app_data):
-    """Обработчик отправки сообщения из GUI"""
     user_text = dpg.get_value("user_input").strip()
     if not user_text:
         return
@@ -442,12 +495,11 @@ def on_send_message(sender, app_data):
     dpg.configure_item("user_input", enabled=False)
     dpg.set_value("status_text", "Thinking...")
     
-    # Отправляем задачу в фоновый asyncio-поток
     future = submit_to_async(handle_async_response(user_text))
     
     def on_done(fut):
         try:
-            fut.result()  # Проверяем на исключения
+            fut.result()
         except Exception as e:
             logger.exception(f"Task failed: {e}")
             dpg.configure_item("user_input", enabled=True)
@@ -457,20 +509,17 @@ def on_send_message(sender, app_data):
 
 
 async def handle_async_response(user_text: str):
-    """Асинхронный обработчик ответа (выполняется в фоне)"""
     try:
         response = await process_message(user_text)
         
-        # Обновление GUI должно быть в главном потоке
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("AI_EveryNyan", response, color=(255, 200, 100))
         
-        # Сохранение в память (асинхронно)
         await save_to_memory(user_text, response)
         
     except Exception as e:
-        logger.exception("Unhandled error in message handling")
+        logger.exception("Unhandled error")
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("Error", str(e), color=(255, 100, 100))
@@ -483,41 +532,37 @@ def main():
     
     logger.info(f"Starting AI_EveryNyan (debug={settings.debug})")
     
-    # Запускаем asyncio в отдельном потоке
+    # Инициализация
+    init_memory_manager()
+    init_components()
+    init_character()
+    
+    # Async loop
     async_loop = asyncio.new_event_loop()
     async_thread = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
     async_thread.start()
     
-    # Инициализация компонентов
-    init_components()
-    
-    # Загрузка персонажа (модульная система)
-    init_character()
-    
-    # Настройка GUI
+    # GUI
     setup_gui()
     
-    # Запуск event loop DearPyGui
     logger.info("Entering DearPyGui main loop...")
     dpg.start_dearpygui()
     
-    # Остановка (при закрытии окна)
+    # Shutdown
     async_loop.call_soon_threadsafe(async_loop.stop)
     async_thread.join(timeout=2.0)
+    if memory_manager:
+        memory_manager.close()
     dpg.destroy_context()
-    
     logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    # Загружаем настройки приложения
     config_path = Path("config/settings.yaml")
     settings = AppSettings.from_yaml(str(config_path))
     
-    # Создаём необходимые директории
     Path(settings.diary.storage_dir).mkdir(parents=True, exist_ok=True)
     Path("logs").mkdir(parents=True, exist_ok=True)
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     
-    # Запускаем приложение
     main()
