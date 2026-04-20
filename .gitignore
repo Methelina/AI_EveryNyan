@@ -1,12 +1,14 @@
-# === Python / Build ===
+# === Python / Build Artifacts ===
 __pycache__/
 *.py[cod]
 *.so
 *.egg-info/
 dist/
 build/
+*.egg
+*.pyc
 
-# === Environments ===
+# === Virtual Environments ===
 env/
 venv/
 .venv/

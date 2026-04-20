@@ -7,6 +7,47 @@ set "ROOT=%~dp0"
 set "QDRANT_DATA=%ROOT%data\qdrant_storage"
 set "CONTAINER_NAME=ai_everynyan-qdrant"
 
+:: === МЕНЮ ===
+:menu
+cls
+echo ==========================================
+echo   Qdrant Launcher - AI_EveryNyan
+echo ==========================================
+echo 1. Start Qdrant
+echo 2. Clean Storage and Restart (WIPE DATA)
+echo 3. Exit
+echo ==========================================
+choice /c 123 /n /m "Select option: "
+
+if %errorlevel% == 2 goto :clean_and_restart
+if %errorlevel% == 3 exit /b 0
+goto :start_qdrant
+
+:: === ФУНКЦИЯ ОЧИСТКИ ===
+:clean_and_restart
+echo.
+echo [INFO] Stopping container...
+docker stop %CONTAINER_NAME% >nul 2>&1
+docker rm %CONTAINER_NAME% >nul 2>&1
+
+echo [INFO] Deleting old storage data...
+if exist "%QDRANT_DATA%" (
+    rmdir /s /q "%QDRANT_DATA%"
+    echo [OK] Storage deleted.
+) else (
+    echo [SKIP] Storage folder not found.
+)
+
+echo [INFO] Restarting script to apply changes...
+timeout /t 2 /nobreak >nul
+cls
+:: Переходим к стандартному запуску, контейнер будет создан заново
+goto :start_qdrant
+
+:: === ОСНОВНАЯ ЛОГИКА ЗАПУСКА ===
+:start_qdrant
+echo.
+
 :: Создаём папку хранения, если нет
 if not exist "%QDRANT_DATA%" mkdir "%QDRANT_DATA%"
 
@@ -15,7 +56,7 @@ docker info >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Docker is not running. Please start Docker Desktop first.
     pause
-    exit /b 1
+    goto :menu
 )
 
 :: Проверяем, существует ли контейнер
@@ -26,7 +67,7 @@ if %errorlevel% == 0 (
         echo [INFO] Qdrant is already running.
         echo     Web UI: http://localhost:6333/dashboard/
         pause
-        exit /b 0
+        goto :menu
     ) else (
         echo [INFO] Starting existing container...
         docker start %CONTAINER_NAME%
@@ -35,7 +76,7 @@ if %errorlevel% == 0 (
 )
 
 :: Запуск нового контейнера
-echo [INFO] Creating & starting Qdrant...
+echo [INFO] Creating ^& starting Qdrant...
 echo     Storage: %QDRANT_DATA%
 docker run -d ^
   --name %CONTAINER_NAME% ^
@@ -50,7 +91,7 @@ docker run -d ^
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to start container.
     pause
-    exit /b 1
+    goto :menu
 )
 
 :wait
@@ -67,3 +108,4 @@ echo [SUCCESS] Qdrant is ready!
 echo     API: http://localhost:6333
 echo     UI:  http://localhost:6333/dashboard/
 pause
+goto :menu
