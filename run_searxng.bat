@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 title AI_EveryNyan - SearXNG Launcher
 
 :: === Пути относительно папки с батником (корень проекта) ===
@@ -8,7 +7,7 @@ set "SEARXNG_DATA=%ROOT%data\searxng_config"
 set "CONTAINER_NAME=ai_everynyan-searxng"
 
 :: === Настройки по умолчанию для SeanXNG ===
-set "SEARXNG_PORT=8080"
+set "SEARXNG_PORT=2597"
 set "SEARXNG_BASE_URL=http://localhost:8080/"
 set "SEARXNG_SECRET="
 set "SEARXNG_LIMIT_MEMORY=1g"
@@ -138,7 +137,7 @@ findstr /C:"- json" "%SEARXNG_DATA%\settings.yml" >nul 2>&1
 if %errorlevel% == 0 (
     echo [OK] JSON format already present in settings.yml.
 ) else (
-    powershell -Command "(Get-Content '%SEARXNG_DATA%\settings.yml') -replace '(?<=- html)', '- html`n    - json' | Set-Content '%SEARXNG_DATA%\settings.yml'"
+    powershell -Command "$nl=[char]10; (Get-Content '%SEARXNG_DATA%\settings.yml') -replace '(?<=- html)', ('- html' + $nl + '    - json') | Set-Content '%SEARXNG_DATA%\settings.yml'"
     echo [OK] JSON format added to settings.yml.
 )
 
@@ -192,24 +191,9 @@ echo pass_ip = []
 ) > "%SEARXNG_DATA%\limiter.toml"
 
 :: Создание и запуск контейнера
-set "RUN_CMD=docker run -d ^
-    --name %CONTAINER_NAME% ^
-    -p %SEARXNG_PORT%:8080 ^
-    -v "%SEARXNG_DATA%:/etc/searxng:rw" ^
-    --memory %SEARXNG_LIMIT_MEMORY% ^
-    --cpus %SEARXNG_LIMIT_CPUS% ^
-    --restart unless-stopped ^
-    --cap-drop ALL ^
-    --cap-add CHOWN ^
-    --cap-add SETGID ^
-    --cap-add SETUID ^
-    --cap-add DAC_OVERRIDE ^
-    --log-driver json-file ^
-    --log-opt max-size=1m ^
-    --log-opt max-file=1 ^
-    -e SEARXNG_BASE_URL=%SEARXNG_BASE_URL%"
+set "RUN_CMD=docker run -d --name %CONTAINER_NAME% -p %SEARXNG_PORT%:8080 -v "%SEARXNG_DATA%:/etc/searxng:rw" --memory %SEARXNG_LIMIT_MEMORY% --cpus %SEARXNG_LIMIT_CPUS% --restart unless-stopped --cap-drop ALL --cap-add CHOWN --cap-add SETGID --cap-add SETUID --cap-add DAC_OVERRIDE --log-driver json-file --log-opt max-size=1m --log-opt max-file=1 -e SEARXNG_BASE_URL=%SEARXNG_BASE_URL%"
 
-:: Добавление секретного ключа, если есть
+:: Добавление секретного ключа и образа, если есть
 if not "%SEARXNG_SECRET%"=="" (
     set "RUN_CMD=%RUN_CMD% -e SEARXNG_SECRET=%SEARXNG_SECRET%"
 )
@@ -223,7 +207,19 @@ echo     Port   : %SEARXNG_PORT%
 %RUN_CMD%
 
 if %errorlevel% neq 0 (
-    echo [ERROR] Failed to start container.
+    echo [WARN] Failed to start. Trying to pull image first...
+    docker pull searxng/searxng:latest
+    if %errorlevel% neq 0 (
+        echo [ERROR] Failed to pull image. Check network or image name.
+        pause
+        goto :menu
+    )
+    :: Повторный запуск после pull
+    %RUN_CMD%
+)
+
+if %errorlevel% neq 0 (
+    echo [ERROR] Failed to start container after pull.
     echo         On first run, try removing --cap-drop ALL and retrying.
     pause
     goto :menu
@@ -245,7 +241,7 @@ if exist "%SEARXNG_DATA%\settings.yml" (
     findstr /C:"- json" "%SEARXNG_DATA%\settings.yml" >nul 2>&1
     if %errorlevel% neq 0 (
         echo [INFO] Patching settings.yml with JSON format...
-        powershell -Command "$c = Get-Content '%SEARXNG_DATA%\settings.yml' -Raw; if ($c -match '- html') { $c = $c -replace '(?m)^(\s*)- html', '$1- html`n$1- json'; Set-Content '%SEARXNG_DATA%\settings.yml' $c -NoNewline }"
+        powershell -Command "$nl=[char]10; $c = Get-Content '%SEARXNG_DATA%\settings.yml' -Raw; if ($c -match '- html') { $c = $c -replace '(?m)^(\s*)- html', ('$1- html' + $nl + '$1- json'); Set-Content '%SEARXNG_DATA%\settings.yml' $c -NoNewline }"
         echo [INFO] Restarting container to apply JSON format...
         docker restart %CONTAINER_NAME% >nul 2>&1
     )
