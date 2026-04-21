@@ -4,7 +4,7 @@ Uses DuckDB for structured chat history and Qdrant for semantic RAG memory.
 Provides Sliding Window mechanism and smart context dumping.
 
 \src\memory_manager.py
-Version:     0.6.0
+Version:     0.7.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 Changes:
@@ -12,6 +12,7 @@ Changes:
   [+] Added circumplex model: affect_valence [-1..1], affect_arousal [-1..1].
   [+] Kept emotion_label as human-readable string.
   [+] Removed legacy regex parsing.
+  [*] Improved from_json method with better error handling.
 """
 
 import duckdb
