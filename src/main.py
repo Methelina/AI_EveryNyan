@@ -4,19 +4,22 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.9.0
+Version:     0.13.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 
-Patch Notes v0.9.0:
-  [+] RAG: added metadata extraction for dialogue entries (entities, topics, key_facts).
-  [+] Fixed dead adaptive threshold code (removed current_relevance_threshold).
-  [+] Improved embedding normalization (normalize=True) for better vector similarity.
-  [+] Enhanced JSON metadata parsing in dump_context_to_memory (robust regex fallback).
-  [+] All AI thoughts now also logged to console/file.
-  [*] Roadmap: re-ranker (3.3) and query preprocessing (3.4) planned.
+Patch Notes v0.13.0:
+  [+] Split LLM configuration: separate settings for chat and embeddings.
+  [+] Added chat_mode and embedding_mode in settings.yaml.
+  [+] Embeddings can now use Ollama while chat uses external LLaMA server.
+  [+] Improved flexibility for mixed backend setups.
 
 Previous versions:
+  v0.12.0: unified LLM config with mode selection.
+  v0.11.0: lemmatization moved to indexing, search uses original query.
+  v0.10.1: fixed GUI initialization order.
+  v0.10.0: added QueryPreprocessor with lemmatization.
+  v0.9.0: metadata extraction for dialogues, fixed embedding normalize bug.
   v0.8.0: plain text RAG, DuckDB keyword fallback, auto-load history.
   v0.7.0: moved parameters to settings.yaml, JSON metadata, circumplex affect.
   v0.6.0: detailed memory reporting, Memory Report button.
@@ -33,7 +36,7 @@ import json
 import yaml
 import re
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Union
+from typing import Optional, List, Dict, Any, Tuple, Union, Literal
 from datetime import datetime
 
 import dearpygui.dearpygui as dpg
@@ -47,6 +50,7 @@ from openai import BadRequestError
 
 # Local imports
 from memory_manager import MemoryManager, DiaryEntryMetadata
+from query_preprocessor import QueryPreprocessor
 
 # ============================================================================
 # Logging Configuration
@@ -67,15 +71,26 @@ logger = logging.getLogger("AI_EveryNyan")
 # Application Configuration (Pydantic + YAML)
 # ============================================================================
 
-class LLMSettings(BaseModel):
-    backend: str = "ollama"
+class OllamaSettings(BaseModel):
     base_url: str = "http://localhost:11434/v1"
+    api_key: str = "ollama"
     chat_model: str = "qwen2.5:7b"
     embedding_model: str = "bge-m3:latest"
     timeout: int = 120
     temperature: float = 0.7
     max_tokens: int = 2048
     token_dump_threshold: int = 20000
+
+
+class LlamaSettings(BaseModel):
+    base_url: str = "http://localhost:8080/v1"
+    api_key: str = ""
+    chat_model: str = "meta-llama/Llama-2-7b-chat-hf"
+    timeout: int = 180
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    token_dump_threshold: int = 20000
+    # embedding_model not used for llama (embeddings come from Ollama or separate)
 
 
 class QdrantSettings(BaseModel):
@@ -88,7 +103,7 @@ class DiarySettings(BaseModel):
     storage_dir: str = "data/diary"
     plagiarism_threshold: float = 0.97
     injection_max_length: int = 5000
-    summary_prompt: str = ""  # загружается из YAML
+    summary_prompt: str = ""
 
 
 class GUISettings(BaseModel):
@@ -121,7 +136,15 @@ class ContextSettings(BaseModel):
 
 
 class AppSettings(BaseSettings):
-    llm: LLMSettings = Field(default_factory=LLMSettings)
+    # Mode selectors
+    chat_mode: Literal["ollama", "llama"] = "ollama"
+    embedding_mode: Literal["ollama", "custom"] = "ollama"  # custom not implemented yet, falls back to ollama
+    
+    # Backend configurations
+    ollama: OllamaSettings = Field(default_factory=OllamaSettings)
+    llama: LlamaSettings = Field(default_factory=LlamaSettings)
+    
+    # Other sections
     vector_db: QdrantSettings = Field(default_factory=QdrantSettings)
     diary: DiarySettings = Field(default_factory=DiarySettings)
     gui: GUISettings = Field(default_factory=GUISettings)
@@ -142,6 +165,23 @@ class AppSettings(BaseSettings):
         except Exception as e:
             logger.error(f"Failed to load settings from {path}: {e}")
             raise
+    
+    def get_chat_config(self):
+        """Return active chat LLM configuration."""
+        if self.chat_mode == "ollama":
+            return self.ollama
+        else:
+            return self.llama
+    
+    def get_embedding_config(self):
+        """Return active embedding configuration."""
+        if self.embedding_mode == "ollama":
+            return self.ollama
+        else:
+            # For custom embedding servers, you would extend this.
+            # Fallback to ollama for now.
+            logger.warning("Custom embedding mode not implemented, falling back to ollama")
+            return self.ollama
 
 
 # ============================================================================
@@ -196,6 +236,7 @@ vector_store: Optional[QdrantVectorStore] = None
 llm: Optional[ChatOpenAI] = None
 embeddings: Optional[OpenAIEmbeddings] = None
 memory_manager: Optional[MemoryManager] = None
+query_preprocessor: Optional[QueryPreprocessor] = None
 
 session_context: List[Dict[str, str]] = []
 anti_repeat_cache: List[Dict[str, Any]] = []
@@ -211,7 +252,6 @@ _shutting_down: bool = False
 # ============================================================================
 
 def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
-    """Add a thought to the AI thoughts panel and also log to console."""
     logger.info(f"[AI_THOUGHT] {text}")
     try:
         if dpg.does_item_exist("thoughts_placeholder"):
@@ -222,7 +262,7 @@ def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
             dpg.add_text(text, color=color)
         dpg.set_y_scroll("ai_thoughts_area", 1e9)
     except Exception as e:
-        logger.debug(f"Thought UI update skipped (early init): {e}")
+        logger.debug(f"Thought UI update skipped: {e}")
 
 
 # ============================================================================
@@ -247,6 +287,14 @@ def submit_to_async(coro) -> asyncio.Future:
 def init_components():
     global qdrant_client, vector_store, llm, embeddings
     logger.info("Initializing components...")
+    
+    chat_cfg = settings.get_chat_config()
+    embed_cfg = settings.get_embedding_config()
+    
+    logger.info(f"Chat mode: {settings.chat_mode}, endpoint: {chat_cfg.base_url}, model: {chat_cfg.chat_model}")
+    logger.info(f"Embedding mode: {settings.embedding_mode}, endpoint: {embed_cfg.base_url}, model: {embed_cfg.embedding_model}")
+    
+    # Qdrant
     qdrant_client = QdrantClient(url=settings.vector_db.url)
     if not qdrant_client.collection_exists(settings.vector_db.collection):
         qdrant_client.create_collection(
@@ -258,14 +306,12 @@ def init_components():
         )
         logger.info(f"Created collection: {settings.vector_db.collection}")
     
-    # 3.5: добавлена нормализация эмбеддингов
+    # Embeddings (could be from Ollama or another OpenAI-compatible server)
     embeddings = OpenAIEmbeddings(
-        model=settings.llm.embedding_model,
-        openai_api_key="ollama",
-        openai_api_base=settings.llm.base_url,
-        # model_kwargs={"normalize": True},  # нормализация векторов
-        check_embedding_ctx_length=False
-        
+        model=embed_cfg.embedding_model,
+        openai_api_key=embed_cfg.api_key,
+        openai_api_base=embed_cfg.base_url,
+        check_embedding_ctx_length=False,
     )
     
     vector_store = QdrantVectorStore(
@@ -273,13 +319,15 @@ def init_components():
         collection_name=settings.vector_db.collection,
         embedding=embeddings
     )
+    
+    # Chat LLM
     llm = ChatOpenAI(
-        model=settings.llm.chat_model,
-        openai_api_key="ollama",
-        openai_api_base=settings.llm.base_url,
-        temperature=settings.llm.temperature,
-        timeout=settings.llm.timeout,
-        max_tokens=settings.llm.max_tokens,
+        model=chat_cfg.chat_model,
+        openai_api_key=chat_cfg.api_key,
+        openai_api_base=chat_cfg.base_url,
+        temperature=chat_cfg.temperature,
+        timeout=chat_cfg.timeout,
+        max_tokens=chat_cfg.max_tokens,
         streaming=False
     )
     logger.info("Components initialized")
@@ -298,6 +346,12 @@ def init_memory_manager():
     memory_manager = MemoryManager()
     stats = memory_manager.get_stats()
     logger.info(f"MemoryManager initialized. Messages: {stats.get('total_messages', 0)}")
+
+
+def init_query_preprocessor():
+    global query_preprocessor
+    query_preprocessor = QueryPreprocessor(add_thought_callback=add_ai_thought)
+    logger.info("QueryPreprocessor initialized (spaCy lemmatization).")
 
 
 # ============================================================================
@@ -361,7 +415,6 @@ async def query_memory(query: str, top_k: Optional[int] = None,
 
 # ---------- DuckDB keyword fallback ----------
 async def keyword_search_in_history(query: str, limit: int = 3) -> str:
-    """Fallback: search chat_history by keywords."""
     if not memory_manager:
         return ""
     keywords = [w for w in query.lower().split() if len(w) > 3]
@@ -378,7 +431,7 @@ async def keyword_search_in_history(query: str, limit: int = 3) -> str:
             return ""
         result_parts = []
         for role, content, ts in rows:
-            sender = "User" if role == "user" else "AI"
+            sender = "User" if role == 'user' else "AI"
             result_parts.append(f"[{ts}] {sender}: {content[:300]}")
         return "\n\n".join(result_parts)
     except Exception as e:
@@ -408,9 +461,8 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
         return False
 
 
-# ---------- Metadata extraction for dialogues (2.8) ----------
+# ---------- Metadata extraction for dialogues ----------
 async def _extract_dialogue_metadata(user_text: str, ai_response: str) -> Dict[str, Any]:
-    """Extract entities, topics, key facts from a dialogue using LLM."""
     prompt = f"""
 Extract metadata from this conversation:
 User: {user_text[:500]}
@@ -426,7 +478,6 @@ Output ONLY valid JSON, no extra text.
     try:
         response = await llm.ainvoke([("system", "You are a metadata extractor. Output only JSON."), ("human", prompt)])
         content = response.content.strip()
-        # Извлекаем JSON из ответа
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
@@ -440,7 +491,7 @@ Output ONLY valid JSON, no extra text.
     return {"entities": [], "topics": [], "key_facts": []}
 
 
-# ---------- Smart context dumping (improved JSON parsing) ----------
+# ---------- Smart context dumping (with lemmatized copy) ----------
 async def dump_context_to_memory():
     global session_context
     if not session_context:
@@ -463,20 +514,15 @@ async def dump_context_to_memory():
             if len(section) < 20:
                 continue
             
-            # 3.7: улучшенный парсинг JSON
             json_str = "{}"
-            # Сначала ищем блок ```json ... ```
             json_block = re.search(r'```json\s*(\{.*?\})\s*```', section, re.DOTALL)
             if json_block:
                 json_str = json_block.group(1)
-                # Удаляем JSON-блок из текста
                 section = re.sub(r'```json.*?```', '', section, flags=re.DOTALL).strip()
             else:
-                # Ищем любой JSON-объект в тексте
                 json_match = re.search(r'(\{.*\})', section, re.DOTALL)
                 if json_match:
                     json_str = json_match.group(1)
-                    # Пытаемся удалить найденный JSON из текста
                     section = section.replace(json_str, "").strip()
             
             clean_section = section[:500] if section else "No content"
@@ -489,6 +535,10 @@ async def dump_context_to_memory():
             
             if await check_plagiarism(clean_section, settings.diary.plagiarism_threshold):
                 continue
+            
+            if query_preprocessor:
+                lemmatized = query_preprocessor.lemmatize_text(clean_section, remove_stopwords=False)
+                parsed_meta.type_specific["lemmatized"] = lemmatized
             
             vector_store.add_texts(texts=[clean_section], metadatas=[parsed_meta.to_qdrant_payload()])
             if memory_manager:
@@ -633,9 +683,13 @@ async def save_to_memory(user_text: str, ai_response: str):
         if len(content) > 2000:
             content = content[:2000].rsplit('.', 1)[0] + '.'
         
-        # 2.8: извлекаем метаданные диалога
         meta = await _extract_dialogue_metadata(user_text, ai_response)
         meta.update({"type": "dialogue", "timestamp": datetime.now().isoformat()})
+        
+        if query_preprocessor:
+            lemmatized = query_preprocessor.lemmatize_text(content, remove_stopwords=False)
+            meta["lemmatized"] = lemmatized
+            add_ai_thought(f"[RAG] Lemmatized copy stored (length {len(lemmatized)})", (150,200,150))
         
         try:
             vector_store.add_texts(texts=[content], metadatas=[meta])
@@ -821,7 +875,7 @@ def main():
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"Starting AI_EveryNyan v0.9.0 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.13.0 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
@@ -834,7 +888,9 @@ def main():
     async_thread.start()
     
     setup_gui()
+    init_query_preprocessor()
     add_ai_thought("[SYS] STATUS: Online. Ready.", (100,255,100))
+    
     try:
         dpg.start_dearpygui()
     finally:

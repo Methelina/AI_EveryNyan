@@ -1,11 +1,17 @@
 <#
 .SYNOPSIS
     Установщик AI_EveryNyan (плоская структура).
-    Создает Conda-окружение, устанавливает зависимости, скачивает bge-m3 в Ollama, генерирует конфиги.
+    Создает Conda-окружение, устанавливает зависимости, скачивает bge-m3 в Ollama,
+    устанавливает spaCy и языковые модели, генерирует конфиги.
     Идемпотентен: безопасен для повторного запуска.
-	
-	\install_ai_everynyan.ps1
-	
+
+    \install_ai_everynyan.ps1
+    Version: 0.4.0
+    Author: Soror L.'.L.'.
+
+    Patchnote v0.4.0:
+      [+] Добавлена установка spaCy и языковых моделей (ru_core_news_sm, en_core_web_sm)
+      [+] Проверка импорта spacy и доступности моделей
 #>
 
 # === Настройка кодировки ===
@@ -106,11 +112,11 @@ debug: false
 # === Основной процесс ===
 
 Write-Status "╔════════════════════════════════════════╗" "INFO"
-Write-Status "║  AI_EveryNyan Installer                ║" "INFO"
+Write-Status "║  AI_EveryNyan Installer v0.4.0         ║" "INFO"
 Write-Status "╚════════════════════════════════════════╝" "INFO"
 
 # 1. Проверка зависимостей
-Write-Status "[1/6] Проверка системных зависимостей..." "INFO"
+Write-Status "[1/7] Проверка системных зависимостей..." "INFO"
 $Missing = @()
 if (!(Test-Command "git")) { $Missing += "Git" }
 if (!(Test-Command "conda")) { $Missing += "Conda (Miniforge/Anaconda)" }
@@ -125,7 +131,7 @@ if ($Missing.Count -gt 0) {
 Write-Status "  [+] Git, Conda, Docker, Ollama найдены" "SUCCESS"
 
 # 2. Создание структуры папок
-Write-Status "`n[2/6] Создание структуры проекта..." "INFO"
+Write-Status "`n[2/7] Создание структуры проекта..." "INFO"
 $Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage")
 foreach ($dir in $Dirs) {
     if (!(Test-Path $dir)) {
@@ -135,7 +141,7 @@ foreach ($dir in $Dirs) {
 Write-Status "  [+] Директории готовы" "SUCCESS"
 
 # 3. Шаблоны конфигов
-Write-Status "`n[3/6] Подготовка конфигурации..." "INFO"
+Write-Status "`n[3/7] Подготовка конфигурации..." "INFO"
 $SettingsExample = Join-Path $ConfigPath "settings.yaml.example"
 $SettingsActual = Join-Path $ConfigPath "settings.yaml"
 
@@ -150,7 +156,7 @@ if (!(Test-Path $SettingsActual)) {
 }
 
 # 4. Установка Ollama-модели bge-m3
-Write-Status "`n[4/6] Проверка embedding-модели bge-m3..." "INFO"
+Write-Status "`n[4/7] Проверка embedding-модели bge-m3..." "INFO"
 
 $modelInstalled = $false
 try {
@@ -177,7 +183,7 @@ if ($modelInstalled) {
 }
 
 # 5. Conda-окружение + pip install
-Write-Status "`n[5/6] Настройка Python-окружения..." "INFO"
+Write-Status "`n[5/7] Настройка Python-окружения..." "INFO"
 
 if (!(Test-Path $EnvPath)) {
     Write-Status "  Создание Conda env: $EnvPath" "INFO"
@@ -204,9 +210,69 @@ if (Test-Path $ReqFile) {
     Write-Status "  [!] requirements.txt не найден в корне" "WARN"
 }
 
-# 6. Проверка импортов
-Write-Status "`n[6/6] Проверка критических импортов..." "INFO"
-$Modules = @("dearpygui.dearpygui", "langchain_core", "qdrant_client", "pydantic", "asyncio")
+# --- Установка spaCy и языковых моделей ---
+Write-Status "`n[6/7] Установка spaCy и языковых моделей..." "INFO"
+
+# Проверка, установлен ли spaCy
+$spacyInstalled = & $PythonExe -c "import spacy" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Status "  Установка spaCy через pip..." "INFO"
+    & $PythonExe -m pip install spacy>=3.7.0
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "  [!] Не удалось установить spaCy" "WARN"
+    } else {
+        Write-Status "  [+] spaCy установлен" "SUCCESS"
+    }
+} else {
+    Write-Status "  [+] spaCy уже установлен" "SUCCESS"
+}
+
+# Функция проверки наличия модели spaCy
+function Test-SpacyModel {
+    param([string]$ModelName)
+    $checkScript = @"
+import spacy
+try:
+    spacy.load('$ModelName')
+    print('OK')
+except OSError:
+    print('MISSING')
+"@
+    $result = & $PythonExe -c $checkScript
+    return $result.Trim() -eq "OK"
+}
+
+# Установка русской модели
+$ruModel = "ru_core_news_sm"
+if (Test-SpacyModel -ModelName $ruModel) {
+    Write-Status "  [+] Модель $ruModel уже установлена" "SUCCESS"
+} else {
+    Write-Status "  Установка модели $ruModel (~40 MB)..." "INFO"
+    & $PythonExe -m spacy download $ruModel
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status "  [+] Модель $ruModel установлена" "SUCCESS"
+    } else {
+        Write-Status "  [!] Не удалось установить $ruModel" "WARN"
+    }
+}
+
+# Установка английской модели
+$enModel = "en_core_web_sm"
+if (Test-SpacyModel -ModelName $enModel) {
+    Write-Status "  [+] Модель $enModel уже установлена" "SUCCESS"
+} else {
+    Write-Status "  Установка модели $enModel (~12 MB)..." "INFO"
+    & $PythonExe -m spacy download $enModel
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status "  [+] Модель $enModel установлена" "SUCCESS"
+    } else {
+        Write-Status "  [!] Не удалось установить $enModel" "WARN"
+    }
+}
+
+# 7. Проверка импортов
+Write-Status "`n[7/7] Проверка критических импортов..." "INFO"
+$Modules = @("dearpygui.dearpygui", "langchain_core", "qdrant_client", "pydantic", "asyncio", "spacy")
 $AllOK = $true
 foreach ($mod in $Modules) {
     & $PythonExe -c "import $mod" 2>$null
@@ -217,7 +283,19 @@ foreach ($mod in $Modules) {
         $AllOK = $false
     }
 }
-if ($AllOK) { Write-Status "  [+] Все импорты успешны" "SUCCESS" }
+
+# Дополнительная проверка моделей spaCy
+if ($AllOK) {
+    $ruCheck = & $PythonExe -c "import spacy; spacy.load('ru_core_news_sm')" 2>$null
+    if ($LASTEXITCODE -eq 0) { Write-Status "    [+] ru_core_news_sm (spacy)" "SUCCESS" }
+    else { Write-Status "    [!] ru_core_news_sm не найдена" "WARN"; $AllOK = $false }
+
+    $enCheck = & $PythonExe -c "import spacy; spacy.load('en_core_web_sm')" 2>$null
+    if ($LASTEXITCODE -eq 0) { Write-Status "    [+] en_core_web_sm (spacy)" "SUCCESS" }
+    else { Write-Status "    [!] en_core_web_sm не найдена" "WARN"; $AllOK = $false }
+}
+
+if ($AllOK) { Write-Status "  [+] Все импорты и модели успешны" "SUCCESS" }
 else { Write-Status "  [!] Ошибка импорта. Проверьте логи или переустановите окружение." "ERROR" }
 
 # === Финал ===
