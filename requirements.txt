@@ -28,3 +28,4 @@ dearpygui>=1.11.0
 structlog>=24.0.0
 PyYAML>=6.0.1
 tqdm>=4.66.0
+spacy>=3.7.0
