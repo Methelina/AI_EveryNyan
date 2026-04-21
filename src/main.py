@@ -4,30 +4,31 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.6.0
+Version:     0.7.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
+
+Patch Notes v0.7.0:
+  [+] All RAG, LLM and context parameters moved to settings.yaml
+  [+] Added RAGSettings (top_k, similarity_threshold)
+  [+] Added ContextSettings (max_history_messages, warn_if_context_exceeds)
+  [+] LLMSettings now includes temperature and max_tokens
+  [+] query_memory uses settings.rag.top_k as default
+  [+] process_message uses settings.context.max_history_messages and warn_if_context_exceeds
+  [+] Retry/rehydration uses settings.context.max_history_messages for limit
 
 Patch Notes v0.6.0:
   [+] Enhanced memory reporting: detailed RAG query logs, context dump steps,
       sliding window events, Qdrant status, DuckDB statistics.
   [+] Added "Memory Report" button to GUI.
   [+] Improved anti-plagiarism and anti-repetition feedback.
-  
+
 Patch Notes v0.5.0:
   [+] Integrated universal diary metadata schema (entities, topics, emotion, etc.)
   [+] Added metadata parsing from LLM output via DiaryEntryMetadata model
   [+] Updated Qdrant operations to use structured payload filtering
   [+] Enhanced RAG queries with metadata-aware filtering support
   [-] Removed emojis; strict technical log format preserved throughout
-  
-Dependencies:
-  - dearpygui>=1.11.0
-  - langchain>=0.2.0, langchain-openai>=0.1.0, langchain-qdrant>=0.1.0
-  - qdrant-client[http]>=1.11.0
-  - pydantic>=2.8.0, pydantic-settings>=2.3.0
-  - duckdb>=0.10.0
-  - ollama>=0.2.0
 """
 
 import os
@@ -80,6 +81,8 @@ class LLMSettings(BaseModel):
     chat_model: str = "qwen2.5:7b"
     embedding_model: str = "bge-m3:latest"
     timeout: int = 120
+    temperature: float = 0.7
+    max_tokens: int = 2048
     token_dump_threshold: int = 20000
 
 
@@ -147,6 +150,17 @@ class AntiRepeatSettings(BaseModel):
     max_history: int = 32
 
 
+class RAGSettings(BaseModel):
+    top_k: int = 3
+    similarity_threshold: float = 0.0
+    enable_metadata_filtering: bool = False
+
+
+class ContextSettings(BaseModel):
+    max_history_messages: int = 10
+    warn_if_context_exceeds: int = 20
+
+
 class AppSettings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     vector_db: QdrantSettings = Field(default_factory=QdrantSettings)
@@ -154,6 +168,8 @@ class AppSettings(BaseSettings):
     gui: GUISettings = Field(default_factory=GUISettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     anti_repeat: AntiRepeatSettings = Field(default_factory=AntiRepeatSettings)
+    rag: RAGSettings = Field(default_factory=RAGSettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     debug: bool = False
     
     model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -307,8 +323,9 @@ def init_components():
         model=settings.llm.chat_model,
         openai_api_key="ollama",
         openai_api_base=settings.llm.base_url,
-        temperature=0.7,
+        temperature=settings.llm.temperature,
         timeout=settings.llm.timeout,
+        max_tokens=settings.llm.max_tokens,
         streaming=False
     )
     
@@ -334,20 +351,28 @@ def init_memory_manager():
 # RAG & Memory Management
 # ============================================================================
 
-async def query_memory(query: str, top_k: int = 3, 
+async def query_memory(query: str, top_k: Optional[int] = None, 
                       filter_meta: Optional[Dict] = None) -> str:
     """
     Semantic search in Qdrant with optional metadata filtering.
     Reports details to UI and log.
+    
+    Args:
+        query: Search query
+        top_k: Number of results (default from settings.rag.top_k)
+        filter_meta: Optional dict for metadata filtering
     """
     global current_relevance_threshold
+    
+    if top_k is None:
+        top_k = settings.rag.top_k
     
     if not vector_store:
         add_ai_thought("[RAG] SKIP: Vector store not initialized", (200,150,150))
         return ""
     
     # Отчет о запросе
-    add_ai_thought(f"[RAG] QUERY: \"{query[:60]}{'...' if len(query)>60 else ''}\"", (180,220,255))
+    add_ai_thought(f"[RAG] QUERY: \"{query[:60]}{'...' if len(query)>60 else ''}\" (k={top_k})", (180,220,255))
     if filter_meta:
         add_ai_thought(f"[RAG] FILTER: {filter_meta}", (180,180,200))
     
@@ -382,6 +407,14 @@ async def query_memory(query: str, top_k: int = 3,
         if not docs_with_scores:
             add_ai_thought(f"[RAG] RESULT: No documents found (k={top_k})", (200,150,150))
             return ""
+        
+        # Фильтрация по similarity_threshold, если задан
+        if settings.rag.similarity_threshold > 0:
+            docs_with_scores = [(doc, score) for doc, score in docs_with_scores 
+                                if score >= settings.rag.similarity_threshold]
+            if not docs_with_scores:
+                add_ai_thought(f"[RAG] RESULT: No documents above threshold {settings.rag.similarity_threshold}", (200,150,150))
+                return ""
         
         docs = [doc for doc, _ in docs_with_scores]
         scores = [score for _, score in docs_with_scores]
@@ -454,8 +487,8 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
 
 async def dump_context_to_memory():
     """
-    Smart context dumping with structured metadata parsing.
-    Detailed reporting on each step.
+    Smart context dumping with JSON metadata extraction.
+    LLM returns a diary section + a JSON block with structured metadata.
     """
     global session_context
     
@@ -468,7 +501,6 @@ async def dump_context_to_memory():
     logger.info(f"[SYS] Dumping {msg_count} messages to memory...")
     add_ai_thought(f"[SUM] START: processing {msg_count} messages", (200,200,100))
     
-    # Отчет о содержимом контекста (первые 5 сообщений)
     for i, msg in enumerate(session_context[:5]):
         add_ai_thought(f"  [{i}] {msg['role']}: {msg['content'][:40]}...", (150,150,180))
     
@@ -480,11 +512,11 @@ async def dump_context_to_memory():
             ("human", f"Here is the conversation to summarize:\n\n{dialogue_text}")
         ]
         
-        add_ai_thought("[LLM] Generating structured diary reflections...", (150,200,255))
+        add_ai_thought("[LLM] Generating structured diary reflections with JSON metadata...", (150,200,255))
         response = await llm.ainvoke(full_prompt)
         diary_entry = response.content
         
-        # Normalize separators
+        # Split by ---
         diary_entry = diary_entry.replace("-- -", "---").replace("- --", "---").replace("----", "---")
         sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         
@@ -494,33 +526,48 @@ async def dump_context_to_memory():
         saved_count = 0
         for idx, section in enumerate(sections):
             if len(section) < 20:
-                add_ai_thought(f"  Section {idx+1}: skipped (too short, {len(section)} chars)", (200,150,150))
+                add_ai_thought(f"  Section {idx+1}: skipped (too short)", (200,150,150))
                 continue
             
-            # Parse structured metadata
+            # Extract JSON metadata from the section
+            # Expected format: ... text ... ```json { ... } ``` or just {...}
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', section, re.DOTALL)
+            if not json_match:
+                # Fallback: find first { and last }
+                start = section.find('{')
+                end = section.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    json_str = section[start:end+1]
+                else:
+                    json_str = "{}"
+            else:
+                json_str = json_match.group(1)
+            
+            # Clean the main text: remove the JSON block and any trailing markers
+            clean_section = re.sub(r'```json.*?```', '', section, flags=re.DOTALL).strip()
+            if not clean_section:
+                clean_section = section[:500]  # fallback
+            
+            # Parse metadata using DiaryEntryMetadata.from_json
+            base_meta = {
+                "timestamp": datetime.now().isoformat(),
+                "section": f"{idx+1}/{total_sections}",
+                "source": "context_dump"
+            }
             try:
-                parsed_meta = DiaryEntryMetadata.from_llm_output(
-                    section,
-                    base_meta={
-                        "timestamp": datetime.now().isoformat(),
-                        "section": f"{idx+1}/{total_sections}",
-                        "source": "context_dump"
-                    }
-                )
-                add_ai_thought(f"  Section {idx+1}: parsed entities={parsed_meta.entities[:3]}, topics={parsed_meta.topics[:3]}", (180,220,180))
-                if parsed_meta.retrieval_cues:
-                    add_ai_thought(f"    Cues: {parsed_meta.retrieval_cues[:3]}", (180,200,180))
-            except Exception as parse_e:
-                logger.warning(f"[PARSE] Fallback: {parse_e}")
-                parsed_meta = DiaryEntryMetadata(
-                    timestamp=datetime.now().isoformat(),
-                    section=f"{idx+1}/{total_sections}",
-                    source="context_dump"
-                )
-                add_ai_thought(f"  Section {idx+1}: fallback metadata (no entities/topics)", (200,150,150))
+                parsed_meta = DiaryEntryMetadata.from_json(json_str, base_meta)
+                add_ai_thought(f"  Section {idx+1}: valence={parsed_meta.affect_valence}, arousal={parsed_meta.affect_arousal}, label={parsed_meta.emotion_label}", (180,220,180))
+                if parsed_meta.entities:
+                    add_ai_thought(f"    Entities: {parsed_meta.entities[:3]}", (180,200,180))
+                if parsed_meta.topics:
+                    add_ai_thought(f"    Topics: {parsed_meta.topics[:3]}", (180,200,180))
+            except Exception as e:
+                logger.warning(f"JSON metadata parse error: {e}")
+                add_ai_thought(f"  Section {idx+1}: metadata parse failed, using minimal", (200,150,150))
+                parsed_meta = DiaryEntryMetadata(**base_meta)
             
             # Anti-plagiarism check
-            is_duplicate = await check_plagiarism(section, settings.diary.plagiarism_threshold)
+            is_duplicate = await check_plagiarism(clean_section, settings.diary.plagiarism_threshold)
             if is_duplicate:
                 add_ai_thought(f"  Section {idx+1}: DUPLICATE, skipped", (255,150,150))
                 continue
@@ -528,20 +575,19 @@ async def dump_context_to_memory():
             # Save to Qdrant
             try:
                 vector_store.add_texts(
-                    texts=[section],
+                    texts=[clean_section],
                     metadatas=[parsed_meta.to_qdrant_payload()]
                 )
-                add_ai_thought(f"  Section {idx+1}: written to Qdrant (dim={settings.vector_db.embedding_dim})", (150,255,150))
+                add_ai_thought(f"  Section {idx+1}: written to Qdrant", (150,255,150))
                 
-                # Save to DuckDB
                 if memory_manager:
                     memory_manager.save_diary_summary(
-                        text=section,
+                        text=clean_section,
                         index=idx,
                         total=total_sections,
                         meta=parsed_meta
                     )
-                    add_ai_thought(f"  Section {idx+1}: written to DuckDB diary_summaries", (150,255,150))
+                    add_ai_thought(f"  Section {idx+1}: written to DuckDB", (150,255,150))
                 
                 saved_count += 1
             except Exception as e:
@@ -550,8 +596,6 @@ async def dump_context_to_memory():
         
         logger.info(f"[SYS] Saved {saved_count}/{total_sections} unique reflections")
         add_ai_thought(f"[DB] FINISH: {saved_count}/{total_sections} stored", (100,255,100))
-        
-        # Clear in-memory context
         session_context.clear()
         add_ai_thought("[SYS] In-memory context cleared", (150,150,150))
         
@@ -660,7 +704,7 @@ async def process_message(user_text: str) -> str:
     async def attempt_generation():
         # Report current context size
         add_ai_thought(f"[CTX] Current context size: {len(session_context)} messages", (150,180,200))
-        if len(session_context) > 20:
+        if len(session_context) > settings.context.warn_if_context_exceeds:
             add_ai_thought(f"[CTX] WARN: Large context ({len(session_context)}), may need dump soon", (255,200,100))
         
         # 2. RAG: retrieve relevant memories
@@ -678,7 +722,7 @@ async def process_message(user_text: str) -> str:
                 "content": f"<retrieved_memories>\n{rag_context}\n</retrieved_memories>"
             })
         
-        max_history = 10
+        max_history = settings.context.max_history_messages
         recent = session_context[-max_history:] if len(session_context) > max_history else session_context
         messages.extend(recent)
         
@@ -703,7 +747,7 @@ async def process_message(user_text: str) -> str:
             if memory_manager:
                 logger.info("[SYS] Rehydrating context from DuckDB...")
                 add_ai_thought("[DB] Loading recent history...", (150,200,255))
-                fresh_history = memory_manager.get_recent_history(limit=10)
+                fresh_history = memory_manager.get_recent_history(limit=settings.context.max_history_messages)
                 
                 if fresh_history:
                     session_context.extend(fresh_history)
@@ -1047,7 +1091,7 @@ def signal_handler(signum, frame):
 def main():
     global settings, async_loop, async_thread
     
-    logger.info(f"Starting AI_EveryNyan v0.6.0 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.7.0 (debug={settings.debug})")
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
