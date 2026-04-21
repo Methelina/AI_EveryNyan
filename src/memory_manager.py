@@ -4,13 +4,14 @@ Uses DuckDB for structured chat history and Qdrant for semantic RAG memory.
 Provides Sliding Window mechanism and smart context dumping.
 
 \src\memory_manager.py
-Version:     0.4.0
+Version:     0.5.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 Changes:
   [+] Added Pydantic model for structured diary metadata validation.
   [+] Added helper methods for metadata parsing and filtering.
   [+] Updated save_diary_summary to support universal metadata schema.
+  [+] Enhanced get_recent_history with count logging.
   [-] Removed emojis; strict technical log format preserved.
 """
 
@@ -277,8 +278,13 @@ class MemoryManager:
 
     def get_recent_history(self, limit: int = 20, 
                           session_id: str = "default") -> List[Dict[str, Any]]:
-        """Retrieve recent messages for Sliding Window rehydration."""
+        """Retrieve recent messages for Sliding Window rehydration with count logging."""
         try:
+            # Get total count for reporting
+            total_count = self.conn.execute("""
+                SELECT COUNT(*) FROM chat_history WHERE session_id = ?
+            """, [session_id]).fetchone()[0]
+            
             result = self.conn.execute("""
                 SELECT role, content, timestamp 
                 FROM chat_history 
@@ -291,7 +297,7 @@ class MemoryManager:
                 {"role": r, "content": c, "timestamp": t} 
                 for r, c, t in reversed(result)
             ]
-            logger.info(f"[DB] READ: Fetched {len(history)} history messages")
+            logger.info(f"[DB] READ: Retrieved {len(history)} of {total_count} total messages (limit={limit})")
             return history
         except Exception as e:
             logger.error(f"[DB] ERR: History fetch failed: {e}")
