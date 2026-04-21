@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
-Modular Character System + Smart Context Management + Graceful Shutdown
+Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.4.3
+Version:     0.5.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 
-Patch Notes v0.4.3:
-  [!] Fixed: Qdrant plagiarism check using client.query() instead of non-existent search()
-  [!] Fixed: DuckDB JSON serialization using json.dumps() instead of str()
-  [+] Improved: Diary section splitting with better --- normalization
-  [+] Improved: Text preservation in Qdrant (preserve newlines in page_content)
+Patch Notes v0.5.0:
+  [+] Integrated universal diary metadata schema (entities, topics, emotion, etc.)
+  [+] Added metadata parsing from LLM output via DiaryEntryMetadata model
+  [+] Updated Qdrant operations to use structured payload filtering
+  [+] Enhanced RAG queries with metadata-aware filtering support
+  [-] Removed emojis; strict technical log format preserved throughout
   
 Dependencies:
   - dearpygui>=1.11.0
@@ -31,8 +32,9 @@ import threading
 import signal
 import json
 import yaml
+import re
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 from datetime import datetime
 
 import dearpygui.dearpygui as dpg
@@ -41,11 +43,11 @@ from pydantic_settings import BaseSettings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
-from qdrant_client.http.models import ScoredPoint
+from qdrant_client.http.models import ScoredPoint, Filter, FieldCondition, MatchValue, MatchAny
 from openai import BadRequestError
 
 # Local imports
-from memory_manager import MemoryManager
+from memory_manager import MemoryManager, DiaryEntryMetadata
 
 # ============================================================================
 # Logging Configuration
@@ -86,25 +88,38 @@ class DiarySettings(BaseModel):
     plagiarism_threshold: float = 0.97
     injection_max_length: int = 5000
     summary_prompt: str = """
-It's time to open diary and share your thoughts, emotions and feelings! 
-Write shortly, but avoid missing details! Avoid plagiarism and copying prior pages.
-Time window: last 24–48h.
+You are updating your personal diary. Process the provided context and write a reflective entry.
+Time window: last 24–48h. Focus on facts, emotions, relationships, and actionable insights.
 
-<outputFormatting>
-ALWAYS divide your diary pages with small (50-300 words) self-sufficient 
-semantically coherent pieces of knowledge with markdown lines `---`.
+<rules>
+1. ALWAYS separate distinct thoughts/events with markdown lines `---`.
+2. Each section must be self-sufficient (50–300 words).
+3. Follow the exact structure below for EVERY section.
+4. Output ONLY the formatted text. No greetings, no explanations, no markdown outside the structure.
+5. DO NOT invent facts. If uncertain, state it explicitly.
+6. Use canonical names for entities (e.g., "Linda" instead of "that girl").
+7. Keep retrieval cues short, keyword-rich, and searchable.
+</rules>
 
-For each section include:
-- timestamps, source event, outcomes
-- entities with canonical names
-- key messages (verbatim, with context)
-- topics/tags, importance score (0–1)
-- emotion/affect, relationships
-- retrieval cues (3–5 short phrases for future search)
-- fine-grained photo descriptions if present
-</outputFormatting>
+<output_format>
+**Timestamp:** [Absolute time or time window]
+**Source Event:** [What triggered this memory]
+**Outcomes:** [Concrete results, decisions, or emotional shifts]
 
-DO NOT MAKE UP FACTS! IF UNSURE, DO NOT MAKE WEAK CONCLUSIONS!
+**Entities:** [Canonical names of people, places, systems]
+**Key Messages:** 
+- "[Verbatim quote 1]"
+- "[Verbatim quote 2]" (include context if needed)
+
+**Topics/Tags:** #[tag1] #[tag2] #[tag3]
+**Importance Score:** [0.0–1.0] – [1-sentence rationale]
+**Emotion/Affect:** [Valence: pos/neg/neu, Arousal: high/med/low, Specific emotion]
+**Relationships:** [How entities relate to each other or to you]
+
+**Retrieval Cues:** ["search phrase 1", "search phrase 2", "search phrase 3"]
+**Photo Descriptions:** [If applicable: detailed visual description + filename]
+**Contradictions/Uncertainties:** [Conflicts, missing info, or things needing verification]
+</output_format>
 """
 
 
@@ -213,32 +228,23 @@ _shutting_down: bool = False
 
 
 # ============================================================================
-# AI Thoughts UI System (Direct Updates - DearPyGui is thread-safe)
+# AI Thoughts UI System (Direct Updates)
 # ============================================================================
 
 def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
-    """
-    Add a thought to the AI thoughts panel.
-    
-    DearPyGui is thread-safe for item configuration, so this can be called
-    from async background threads without additional locking.
-    """
+    """Add a thought to the AI thoughts panel using technical format."""
     try:
-        # Remove placeholder if it exists
         if dpg.does_item_exist("thoughts_placeholder"):
             dpg.delete_item("thoughts_placeholder")
         
-        # Add new thought with timestamp
         timestamp = datetime.now().strftime("%H:%M:%S")
         with dpg.group(parent="ai_thoughts_area", horizontal=True):
             dpg.add_text(f"[{timestamp}] ", color=(100, 100, 100))
             dpg.add_text(text, color=color)
         
-        # Auto-scroll to bottom
         dpg.set_y_scroll("ai_thoughts_area", 1e9)
         
     except Exception as e:
-        # UI updates may fail if DearPyGui isn't fully initialized yet
         logger.debug(f"Thought UI update skipped (early init): {e}")
 
 
@@ -308,35 +314,69 @@ def init_character():
     logger.info("Loading character configuration...")
     character_base = CharacterConfig.load_base()
     character_appearance = CharacterConfig.load_appearance()
-    logger.info("✓ Character brain loaded correctly. All systems nominal")
+    logger.info("Character brain loaded correctly. All systems nominal")
 
 
 def init_memory_manager():
     global memory_manager
     memory_manager = MemoryManager()
     stats = memory_manager.get_stats()
-    logger.info(f"✓ MemoryManager initialized. Messages: {stats.get('total_messages', 0)}")
+    logger.info(f"MemoryManager initialized. Messages: {stats.get('total_messages', 0)}")
 
 
 # ============================================================================
 # RAG & Memory Management
 # ============================================================================
 
-async def query_memory(query: str, top_k: int = 3) -> str:
+async def query_memory(query: str, top_k: int = 3, 
+                      filter_meta: Optional[Dict] = None) -> str:
+    """
+    Semantic search in Qdrant with optional metadata filtering.
+    
+    Args:
+        query: Search query
+        top_k: Number of results
+        filter_meta: Optional dict for metadata filtering, e.g., {"topics": ["food"]}
+    """
     global current_relevance_threshold
     
     if not vector_store:
         return ""
     
     try:
-        docs = await vector_store.asimilarity_search(query, k=top_k)
+        # Build Qdrant filter if metadata filter provided
+        qdrant_filter = None
+        if filter_meta:
+            must_conditions = []
+            for key, value in filter_meta.items():
+                if isinstance(value, list):
+                    # Match any of the values (OR logic within field)
+                    must_conditions.append(
+                        FieldCondition(
+                            key=f"metadata.{key}",
+                            match=MatchAny(any=value)
+                        )
+                    )
+                else:
+                    must_conditions.append(
+                        FieldCondition(
+                            key=f"metadata.{key}",
+                            match=MatchValue(value=value)
+                        )
+                    )
+            if must_conditions:
+                qdrant_filter = Filter(must=must_conditions)
+        
+        docs = await vector_store.asimilarity_search(
+            query, k=top_k, filter=qdrant_filter
+        )
+        
         if not docs:
             return ""
         
         formatted_memories = []
         for i, doc in enumerate(docs):
             relevance = doc.metadata.get("score", "high")
-            # Preserve newlines in memory content for better LLM parsing
             memory_xml = (
                 f'<memory_piece id="{i}" relatedness="{relevance}">\n'
                 f'{doc.page_content}\n'
@@ -346,6 +386,7 @@ async def query_memory(query: str, top_k: int = 3) -> str:
         
         result = "\n\n".join(formatted_memories)
         
+        # Adaptive threshold logic
         if formatted_memories:
             if len(formatted_memories) < top_k:
                 current_relevance_threshold = max(0.3, current_relevance_threshold * 0.95)
@@ -360,20 +401,13 @@ async def query_memory(query: str, top_k: int = 3) -> str:
 
 
 async def check_plagiarism(text: str, threshold: float) -> bool:
-    """
-    Check if text is too similar to existing entries in Qdrant.
-    
-    Uses QdrantClient.query() API (v1.11+ compatible).
-    Returns True if duplicate found (should skip saving).
-    """
+    """Check if text is too similar to existing entries in Qdrant."""
     if not vector_store or not qdrant_client:
         return False
     
     try:
-        # Get embedding for the new text
         query_vector = await embeddings.aembed_query(text)
         
-        # Use QdrantClient.query() for compatibility with v1.11+
         results: List[ScoredPoint] = qdrant_client.query_points(
             collection_name=settings.vector_db.collection,
             query=query_vector,
@@ -383,41 +417,40 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
         ).points
         
         if results:
-            similarity = results[0].score  # Cosine similarity [0, 1]
+            similarity = results[0].score
             if similarity > threshold:
                 logger.info(
-                    f"[PLAGIARISM] Skipped duplicate. "
+                    f"[MEM] Skipped duplicate. "
                     f"Similarity: {similarity:.3f} > {threshold}"
                 )
-                add_ai_thought(f"🚫 Skipped duplicate memory (similarity: {similarity:.2f})", (255, 150, 150))
+                add_ai_thought(f"[MEM] BLOCK: Duplicate content (similarity: {similarity:.2f})", (255, 150, 150))
                 return True
         
         return False
         
     except Exception as e:
         logger.warning(f"Plagiarism check failed: {e}")
-        # Fail-safe: if check fails, assume not duplicate to avoid data loss
         return False
 
 
 async def dump_context_to_memory():
     """
-    Smart context dumping (like C++ diaryDumpMessages).
-    
-    1. LLM writes diary entry with sections separated by ---
-    2. Each section is checked for plagiarism
-    3. Unique sections saved to Qdrant (RAG) and DuckDB (history)
-    4. In-memory context cleared
+    Smart context dumping with structured metadata parsing.
+    1. LLM writes diary entry with structured format
+    2. Parse output into DiaryEntryMetadata
+    3. Check plagiarism
+    4. Save to Qdrant (with structured payload) & DuckDB
+    5. Clear in-memory context
     """
     global session_context
     
     if not session_context:
-        logger.info("[SLIDING WINDOW] Context empty, nothing to dump")
-        add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
+        logger.info("[SYS] Context empty, nothing to dump")
+        add_ai_thought("[SYS] STATUS: Idle (no context to save)", (150, 150, 150))
         return
     
-    logger.info(f"[SLIDING WINDOW] Dumping {len(session_context)} messages to memory...")
-    add_ai_thought(f"📝 Summarizing {len(session_context)} messages into diary...", (200, 200, 100))
+    logger.info(f"[SYS] Dumping {len(session_context)} messages to memory...")
+    add_ai_thought(f"[SUM] Processing {len(session_context)} messages...", (200, 200, 100))
     
     try:
         # 1. Format dialogue for LLM summarization
@@ -426,36 +459,51 @@ async def dump_context_to_memory():
             for msg in session_context
         ])
         
-        # 2. Prompt LLM to write diary entry (using config prompt)
+        # 2. Prompt LLM to write structured diary entry
         full_prompt = [
             ("system", settings.diary.summary_prompt),
             ("human", f"Here is the conversation to summarize:\n\n{dialogue_text}")
         ]
         
-        add_ai_thought("🧠 LLM is writing diary reflections...", (150, 200, 255))
+        add_ai_thought("[LLM] Generating structured diary reflections...", (150, 200, 255))
         response = await llm.ainvoke(full_prompt)
         diary_entry = response.content
         
-        # 3. Normalize separators: handle various --- formats
-        # Replace common variations with standard markdown line
+        # 3. Normalize separators and split into sections
         diary_entry = diary_entry.replace("-- -", "---")
         diary_entry = diary_entry.replace("- --", "---")
-        diary_entry = diary_entry.replace("----", "---")  # 4 dashes -> 3
-        diary_entry = diary_entry.replace("\n---\n", "\n---\n")  # ensure consistent newlines
+        diary_entry = diary_entry.replace("----", "---")
         
-        # Split into sections, preserving content
         sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         
         saved_count = 0
         total_sections = len(sections)
-        add_ai_thought(f"📖 Split into {total_sections} sections. Checking for plagiarism...", (200, 180, 255))
+        add_ai_thought(f"[PROC] Analyzing {total_sections} sections...", (200, 180, 255))
         
         for idx, section in enumerate(sections):
-            # Skip very short sections (noise)
             if len(section) < 20:
                 continue
             
-            # 4. Anti-plagiarism check
+            # 4. Parse structured metadata from LLM output
+            try:
+                parsed_meta = DiaryEntryMetadata.from_llm_output(
+                    section,
+                    base_meta={
+                        "timestamp": datetime.now().isoformat(),
+                        "section": f"{idx+1}/{total_sections}",
+                        "source": "context_dump"
+                    }
+                )
+                logger.debug(f"[PARSE] Metadata extracted: entities={parsed_meta.entities}, topics={parsed_meta.topics}")
+            except Exception as parse_e:
+                logger.warning(f"[PARSE] Fallback: using minimal metadata due to: {parse_e}")
+                parsed_meta = DiaryEntryMetadata(
+                    timestamp=datetime.now().isoformat(),
+                    section=f"{idx+1}/{total_sections}",
+                    source="context_dump"
+                )
+            
+            # 5. Anti-plagiarism check
             is_duplicate = await check_plagiarism(
                 section, 
                 settings.diary.plagiarism_threshold
@@ -463,65 +511,53 @@ async def dump_context_to_memory():
             if is_duplicate:
                 continue
             
-            # 5. Save to Qdrant (for RAG semantic search)
+            # 6. Save to Qdrant with structured payload
             try:
-                # Preserve newlines in page_content for better readability
                 vector_store.add_texts(
                     texts=[section],
-                    metadatas=[{
-                        "type": "diary_reflection",
-                        "timestamp": datetime.now().isoformat(),
-                        "section": f"{idx+1}/{total_sections}",
-                        "source": "context_dump"
-                    }]
+                    metadatas=[parsed_meta.to_qdrant_payload()]
                 )
                 
-                # 6. Save to DuckDB (for structured history)
+                # 7. Save to DuckDB with full metadata dict
                 if memory_manager:
                     memory_manager.save_diary_summary(
                         text=section,
                         index=idx,
                         total=total_sections,
-                        meta={"type": "reflection"}
+                        meta=parsed_meta
                     )
                 
                 saved_count += 1
-                add_ai_thought(f"✅ Saved reflection {idx+1}/{total_sections}", (150, 255, 150))
+                add_ai_thought(f"[MEM] WRITE: Section {idx+1}/{total_sections} OK", (150, 255, 150))
                 
             except Exception as e:
                 logger.error(f"Failed to save section {idx}: {e}")
                 continue
         
         logger.info(
-            f"[SLIDING WINDOW] Saved {saved_count}/{total_sections} "
+            f"[SYS] Saved {saved_count}/{total_sections} "
             f"unique reflections to memory"
         )
-        add_ai_thought(f"💾 Diary updated: {saved_count}/{total_sections} memories stored.", (100, 255, 100))
+        add_ai_thought(f"[DB] STATUS: {saved_count}/{total_sections} items stored.", (100, 255, 100))
         
-        # 7. Clear in-memory context (Sliding Window reset)
+        # 8. Clear in-memory context
         session_context.clear()
-        logger.info("[SLIDING WINDOW] In-memory context cleared")
-        add_ai_thought("🧹 Working memory cleared.", (150, 150, 150))
+        logger.info("[SYS] In-memory context cleared")
+        add_ai_thought("[SYS] STATUS: Working memory cleared.", (150, 150, 150))
         
     except Exception as e:
-        logger.error(f"[SLIDING WINDOW] Failed to dump context: {e}")
-        add_ai_thought(f"❌ Failed to save memories: {e}", (255, 100, 100))
+        logger.error(f"[SYS] Failed to dump context: {e}")
+        add_ai_thought(f"[ERR] Dump failed: {e}", (255, 100, 100))
 
 
 def check_anti_repetition_semantic(new_content: str) -> bool:
-    """
-    Semantic anti-repetition check (like C++ REPEAT_YOURSELF_TRIGGER_*).
-    
-    Compares new assistant response with recent history using embeddings.
-    Returns True if content is too similar (should trigger topic change).
-    """
+    """Semantic anti-repetition check."""
     global anti_repeat_cache
     
     if not anti_repeat_cache or not embeddings:
         return False
     
     try:
-        # Get embedding for new content
         new_embedding = embeddings.embed_query(new_content)
         
         max_similarity = 0.0
@@ -532,9 +568,7 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
             if cached_embedding is None:
                 continue
             
-            # Compute cosine similarity
             similarity = sum(a * b for a, b in zip(new_embedding, cached_embedding))
-            # Normalize to [0, 1] range (cosine similarity is [-1, 1])
             similarity = (similarity + 1) / 2
             
             max_similarity = max(max_similarity, similarity)
@@ -543,29 +577,26 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
         if anti_repeat_cache:
             avg_similarity /= len(anti_repeat_cache)
         
-        # Check against thresholds (from config)
         if max_similarity > settings.anti_repeat.trigger_max:
             logger.warning(
-                f"[ANTI-REPEAT] Max similarity {max_similarity:.3f} > "
+                f"[ANTIREPEAT] Max similarity {max_similarity:.3f} > "
                 f"{settings.anti_repeat.trigger_max}"
             )
             return True
         
         if avg_similarity > settings.anti_repeat.trigger_avg:
             logger.warning(
-                f"[ANTI-REPEAT] Avg similarity {avg_similarity:.3f} > "
+                f"[ANTIREPEAT] Avg similarity {avg_similarity:.3f} > "
                 f"{settings.anti_repeat.trigger_avg}"
             )
             return True
         
-        # Add new embedding to cache (with LRU eviction)
         anti_repeat_cache.append({
-            "content": new_content[:200],  # Store snippet for debugging
+            "content": new_content[:200],
             "embedding": new_embedding,
             "timestamp": datetime.now()
         })
         
-        # Evict old entries if cache too large
         if len(anti_repeat_cache) > settings.anti_repeat.max_history:
             anti_repeat_cache.pop(0)
         
@@ -573,7 +604,7 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
         
     except Exception as e:
         logger.warning(f"Anti-repetition check failed: {e}")
-        return False  # Fail-safe: don't block on error
+        return False
 
 
 # ============================================================================
@@ -581,9 +612,7 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
 # ============================================================================
 
 def build_system_prompt() -> str:
-    """
-    Assemble final system prompt from character config + instructions.
-    """
+    """Assemble final system prompt from character config + instructions."""
     if not character_base or not character_appearance:
         return "You are a helpful assistant."
     
@@ -607,25 +636,19 @@ def build_system_prompt() -> str:
 # ============================================================================
 
 async def process_message(user_text: str) -> str:
-    """
-    Main message processing loop with Sliding Window support.
-    
-    Flow:
-    1. Check for semantic repetition
-    2. Build prompt with system + context + RAG + user message
-    3. Call LLM
-    4. Handle context overflow with smart dumping
-    """
+    """Main message processing loop with Sliding Window support."""
     global session_context
     
-    # 1. Anti-repetition check (semantic)
+    # 1. Anti-repetition check
     if check_anti_repetition_semantic(user_text):
-        add_ai_thought("🔄 Detected repetition. Suggesting topic change.", (255, 200, 100))
-        return "I feel like we're going in circles. Let's talk about something new! 🐾"
+        add_ai_thought("[AI] LOOP: Repetition detected. Switching topic.", (255, 200, 100))
+        return "I feel like we're going in circles. Let's talk about something new!"
     
-    # Inner function to avoid code duplication in retry logic
+    # Inner function for retry logic
     async def attempt_generation():
-        # 2. RAG: retrieve relevant memories
+        # 2. RAG: retrieve relevant memories with optional metadata filtering
+        # Example: filter by high-importance entries only
+        # rag_context = await query_memory(user_text, filter_meta={"importance_score": {"$gte": 0.7}})
         rag_context = await query_memory(user_text)
         
         # 3. Build system prompt
@@ -634,19 +657,16 @@ async def process_message(user_text: str) -> str:
         # 4. Assemble messages for LLM
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add RAG context if found (formatted as XML)
         if rag_context:
             messages.append({
                 "role": "system",
                 "content": f"<retrieved_memories>\n{rag_context}\n</retrieved_memories>"
             })
         
-        # Add recent session history (Sliding Window)
         max_history = 10
         recent = session_context[-max_history:] if len(session_context) > max_history else session_context
         messages.extend(recent)
         
-        # Add current user message
         messages.append({"role": "user", "content": user_text})
         
         # 5. Call LLM
@@ -654,77 +674,67 @@ async def process_message(user_text: str) -> str:
         return response.content
     
     try:
-        # First attempt
         return await attempt_generation()
         
     except BadRequestError as e:
-        # Handle context length overflow (Sliding Window trigger)
         if "context length" in str(e).lower() or "exceeds" in str(e).lower():
             logger.warning(
-                "[SLIDING WINDOW] Context length exceeded. "
-                "Initiating smart dump sequence..."
+                "[SYS] Context length exceeded. Initiating dump..."
             )
-            add_ai_thought("⚠️ Context overflow! Compressing memory...", (255, 150, 100))
+            add_ai_thought("[WARN] Context Overflow. Compressing...", (255, 150, 100))
             
-            # Step 1: Summarize and save old context to memory
+            # Step 1: Summarize and save old context
             await dump_context_to_memory()
             
-            # Step 2: Rehydrate context from DuckDB (recent history)
+            # Step 2: Rehydrate context from DuckDB
             if memory_manager:
-                logger.info("[SLIDING WINDOW] Rehydrating context from DuckDB...")
-                add_ai_thought("📥 Rehydrating recent chat history...", (150, 200, 255))
+                logger.info("[SYS] Rehydrating context from DuckDB...")
+                add_ai_thought("[DB] Loading recent history...", (150, 200, 255))
                 fresh_history = memory_manager.get_recent_history(limit=10)
                 
                 if fresh_history:
                     session_context.extend(fresh_history)
                     logger.info(
-                        f"[SLIDING WINDOW] Rehydrated with "
+                        f"[SYS] Rehydrated with "
                         f"{len(fresh_history)} messages"
                     )
             
-            # Step 3: Retry generation with fresh context
-            logger.info("[SLIDING WINDOW] Retrying generation...")
-            add_ai_thought("🔄 Retrying with fresh context...", (200, 200, 100))
+            # Step 3: Retry generation
+            logger.info("[SYS] Retrying generation...")
+            add_ai_thought("[SYS] RETRY: Generating response...", (200, 200, 100))
             try:
                 return await attempt_generation()
             except Exception as retry_e:
-                logger.error(f"[SLIDING WINDOW] Retry failed: {retry_e}")
+                logger.error(f"[SYS] Retry failed: {retry_e}")
                 return "I tried to organize my memories, but my head is still spinning. Could we try a shorter sentence?"
         else:
-            # Other BadRequest errors: re-raise
             raise
             
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
-        add_ai_thought(f"❌ LLM Error: {e}", (255, 100, 100))
+        add_ai_thought(f"[ERR] LLM Error: {e}", (255, 100, 100))
         return f"Sorry, I encountered an error: {e}"
 
 
 async def save_to_memory(user_text: str, ai_response: str):
-    """
-    Save dialogue to both DuckDB (history) and Qdrant (RAG).
-    
-    Includes length truncation for embedding safety.
-    """
+    """Save dialogue to both DuckDB (history) and Qdrant (RAG)."""
     global session_context
     
-    # 1. Save to DuckDB (structured history)
+    # 1. Save to DuckDB
     if memory_manager:
         memory_manager.save_message("user", user_text)
         memory_manager.save_message("assistant", ai_response)
     
-    # 2. Add to in-memory session context (Sliding Window)
+    # 2. Add to in-memory session context
     session_context.append({"role": "user", "content": user_text})
     session_context.append({"role": "assistant", "content": ai_response})
     
-    # 3. Save to Qdrant (semantic RAG)
+    # 3. Save to Qdrant (raw dialogue, minimal metadata)
     if vector_store:
-        # Truncate if too long for embedding model
         content = f"User: {user_text}\nAI: {ai_response}"
-        max_chars = 2000  # Safe limit for most embedding models
+        max_chars = 2000
         
         if len(content) > max_chars:
-            # Smart truncation: cut at last sentence boundary
             truncated = content[:max_chars].rsplit('.', 1)[0] + '.'
             logger.debug(
                 f"Truncated dialogue from {len(content)} to {len(truncated)} chars"
@@ -748,24 +758,32 @@ async def save_to_memory(user_text: str, ai_response: str):
 # ============================================================================
 
 def find_available_font() -> Optional[str]:
-    """
-    Find first available font from preference list.
-    Prioritizes fonts with Cyrillic support.
-    """
-    fonts_to_try = [
-        r"C:\Windows\Fonts\JetBrainsMono Nerd Font.ttf",
-        r"C:\Windows\Fonts\JetBrainsMonoNL-Regular.ttf",
+    """Find first available font from preference list."""
+    local_font_dir = Path("data/fonts")
+    local_fonts_to_try = [
+        "JetBrainsMonoNerdFont-Regular.ttf",
+        "JetBrainsMonoNerdFont-Medium.ttf",
+        "JetBrainsMonoNerdFont-Bold.ttf",
+    ]
+
+    for font_file in local_fonts_to_try:
+        font_path = local_font_dir / font_file
+        if font_path.exists():
+            logger.info(f"[SYS] Using local font: {font_path}")
+            return str(font_path)
+
+    system_fonts_to_try = [
         r"C:\Windows\Fonts\consola.ttf",
-        r"C:\Windows\Fonts\segoeui.ttf", 
+        r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\arial.ttf",
     ]
-    
-    for font_path in fonts_to_try:
+
+    for font_path in system_fonts_to_try:
         if Path(font_path).exists():
-            logger.info(f"Using font: {font_path}")
+            logger.info(f"[SYS] Using system fallback font: {font_path}")
             return font_path
-    
-    logger.warning("No preferred fonts found, using DearPyGui default")
+
+    logger.warning("[SYS] No preferred fonts found, using DearPyGui default")
     return None
 
 
@@ -773,16 +791,15 @@ def setup_gui():
     """Initialize DearPyGui context, viewport, and widgets."""
     dpg.create_context()
     
-    # Font setup with Cyrillic support
+    # --- Font Loading ---
     font_path = find_available_font()
     if font_path:
         with dpg.font_registry():
             with dpg.font(font_path, 16) as main_font:
-                # Modern DearPyGui auto-detects character ranges
                 pass
         dpg.bind_font(main_font)
-        logger.info("✓ Font with Cyrillic support loaded")
-    
+        logger.info("[SYS] Font loaded successfully")
+
     # Viewport setup
     dpg.create_viewport(
         title=settings.gui.title,
@@ -811,7 +828,6 @@ def setup_gui():
     ):
         # Scrollable chat area
         with dpg.child_window(tag="chat_area", height=-200, border=False):
-            # Load and display recent history from DuckDB
             if memory_manager:
                 history = memory_manager.get_recent_history(limit=50)
                 for msg in history:
@@ -833,8 +849,8 @@ def setup_gui():
                 )
         
         # AI Thoughts Panel
-        with dpg.child_window(tag="ai_thoughts_area", height=120, label="🧠 AI Internal Thoughts", border=True):
-            dpg.add_text("🧠 Панель мыслей пуста", tag="thoughts_placeholder", color=(100, 100, 100))
+        with dpg.child_window(tag="ai_thoughts_area", height=120, label="[SYSTEM] LOG", border=True):
+            dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100, 100, 100))
         
         # Input area
         with dpg.group(horizontal=True):
@@ -855,12 +871,7 @@ def setup_gui():
 
 
 def add_chat_message(sender: str, text: str, color: tuple):
-    """
-    Add a message to the chat UI (must be called from main thread).
-    
-    Auto-scrolls to bottom after adding.
-    """
-    # Scroll to bottom before adding
+    """Add a message to the chat UI."""
     dpg.set_y_scroll("chat_area", 1e9)
     
     with dpg.group(parent="chat_area", horizontal=False):
@@ -871,7 +882,6 @@ def add_chat_message(sender: str, text: str, color: tuple):
             dpg.add_text(text, wrap=wrap_width)
         dpg.add_spacer(height=5)
     
-    # Scroll to bottom after adding
     dpg.set_y_scroll("chat_area", 1e9)
 
 
@@ -885,20 +895,17 @@ def on_send_message(sender, app_data):
     if not user_text:
         return
     
-    # Display user message
     add_chat_message("You", user_text, color=(100, 200, 255))
     dpg.set_value("user_input", "")
     dpg.configure_item("user_input", enabled=False)
     dpg.set_value("status_text", "Thinking...")
-    add_ai_thought(f"💬 Received: \"{user_text[:30]}{'...' if len(user_text)>30 else ''}\"", (150, 200, 255))
+    add_ai_thought(f"[IN] User: \"{user_text[:30]}{'...' if len(user_text)>30 else ''}\"", (150, 200, 255))
     
-    # Submit async processing to background loop
     future = submit_to_async(handle_async_response(user_text))
     
-    # Callback when async task completes
     def on_done(fut):
         try:
-            fut.result()  # Propagate any exceptions
+            fut.result()
         except Exception as e:
             logger.exception(f"Task failed: {e}")
             dpg.configure_item("user_input", enabled=True)
@@ -908,22 +915,15 @@ def on_send_message(sender, app_data):
 
 
 async def handle_async_response(user_text: str):
-    """
-    Async handler: process message and update UI.
-    
-    Runs in background asyncio thread; UI updates scheduled to main thread.
-    """
+    """Async handler: process message and update UI."""
     try:
-        # Process message through LLM + RAG pipeline
         response = await process_message(user_text)
         
-        # Update UI (must be on main thread - DearPyGui is not thread-safe)
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("AI_EveryNyan", response, color=(255, 200, 100))
-        add_ai_thought("✅ Response generated & displayed.", (150, 255, 150))
+        add_ai_thought("[SYS] Response generated.", (150, 255, 150))
         
-        # Save to memory (async)
         await save_to_memory(user_text, response)
         
     except Exception as e:
@@ -931,7 +931,7 @@ async def handle_async_response(user_text: str):
         dpg.configure_item("user_input", enabled=True)
         dpg.set_value("status_text", "")
         add_chat_message("Error", str(e), color=(255, 100, 100))
-        add_ai_thought(f"❌ Handler Error: {e}", (255, 100, 100))
+        add_ai_thought(f"[ERR] Handler Error: {e}", (255, 100, 100))
 
 
 # ============================================================================
@@ -944,27 +944,25 @@ def initiate_graceful_shutdown():
         return
     _shutting_down = True
     
-    logger.info("🛑 Initiating graceful shutdown sequence...")
-    add_ai_thought("🛑 Shutting down. Saving memories to diary...", (255, 150, 150))
+    logger.info("[SYS] Initiating graceful shutdown sequence...")
+    add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255, 150, 150))
     dpg.configure_item("user_input", enabled=False)
-    dpg.set_value("status_text", "Saving memories... 🐾")
+    dpg.set_value("status_text", "Saving memories...")
     
-    # Run async dump in background loop
     if session_context:
         try:
             future = asyncio.run_coroutine_threadsafe(dump_context_to_memory(), async_loop)
-            future.result(timeout=30)  # Wait up to 30s
-            add_ai_thought("✅ Memory dump complete.", (150, 255, 150))
+            future.result(timeout=30)
+            add_ai_thought("[SYS] STATUS: Save complete.", (150, 255, 150))
         except asyncio.TimeoutError:
-            logger.warning("⚠ Context dump timed out")
-            add_ai_thought("⚠️ Dump timed out. Exiting anyway.", (255, 200, 100))
+            logger.warning("[SYS] Context dump timed out")
+            add_ai_thought("[WARN] Save timed out.", (255, 200, 100))
         except Exception as e:
-            logger.error(f"⚠ Failed to dump context: {e}")
-            add_ai_thought(f"❌ Dump failed: {e}", (255, 100, 100))
+            logger.error(f"[SYS] Failed to dump context: {e}")
+            add_ai_thought(f"[ERR] Dump failed: {e}", (255, 100, 100))
     else:
-        add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
+        add_ai_thought("[SYS] STATUS: Nothing to save.", (150, 150, 150))
     
-    # Stop DearPyGui
     dpg.stop_dearpygui()
 
 
@@ -980,9 +978,8 @@ def signal_handler(signum, frame):
 def main():
     global settings, async_loop, async_thread
     
-    logger.info(f"Starting AI_EveryNyan v0.4.3 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.5.0 (debug={settings.debug})")
     
-    # Register signal handlers for Ctrl+C and termination
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
@@ -996,48 +993,42 @@ def main():
     
     setup_gui()
     
-    logger.info("✓ Entering DearPyGui main loop...")
-    add_ai_thought("🚀 System online. Ready for interaction.", (100, 255, 100))
+    logger.info("[GUI] Starting loop...")
+    add_ai_thought("[SYS] STATUS: Online. Ready.", (100, 255, 100))
     
     try:
         dpg.start_dearpygui()
     finally:
-        # === Graceful shutdown: ALWAYS dump context on exit (window close OR signal) ===
-        logger.info("🛑 Initiating graceful shutdown sequence...")
-        add_ai_thought("🛑 Shutting down. Saving memories to diary...", (255, 150, 150))
+        logger.info("[SYS] Initiating graceful shutdown sequence...")
+        add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255, 150, 150))
         dpg.configure_item("user_input", enabled=False)
-        dpg.set_value("status_text", "Saving memories... 🐾")
+        dpg.set_value("status_text", "Saving memories...")
         
-        # Debug: log context size at shutdown
         logger.info(f"DEBUG: session_context size at shutdown: {len(session_context)}")
         if session_context:
             for i, msg in enumerate(session_context[-5:], max(0, len(session_context)-5)):
                 logger.debug(f"  [{i}] {msg['role']}: {msg['content'][:50]}...")
         
-        # Сохраняем контекст, если есть что сохранять
         if session_context:
             try:
-                # Запускаем дамп в фоновом async loop
                 future = asyncio.run_coroutine_threadsafe(
                     dump_context_to_memory(), 
                     async_loop
                 )
-                # Ждём с таймаутом, чтобы не зависнуть
                 future.result(timeout=300)
-                add_ai_thought("✅ Memory dump complete.", (150, 255, 150))
+                add_ai_thought("[SYS] STATUS: Save complete.", (150, 255, 150))
             except asyncio.TimeoutError:
-                logger.warning("⚠ Context dump timed out")
-                add_ai_thought("⚠️ Dump timed out. Exiting anyway.", (255, 200, 100))
+                logger.warning("[SYS] Context dump timed out")
+                add_ai_thought("[WARN] Save timed out.", (255, 200, 100))
             except Exception as e:
-                logger.error(f"⚠ Failed to dump context: {e}")
-                add_ai_thought(f"❌ Dump failed: {e}", (255, 100, 100))
+                logger.error(f"[SYS] Failed to dump context: {e}")
+                add_ai_thought(f"[ERR] Dump failed: {e}", (255, 100, 100))
         else:
-            logger.info("ℹ️ No active context to save at shutdown")
-            add_ai_thought("ℹ️ No active context to save.", (150, 150, 150))
+            logger.info("[SYS] No active context to save at shutdown")
+            add_ai_thought("[SYS] STATUS: Nothing to save.", (150, 150, 150))
         
-        # Останавливаем фоновые сервисы
         logger.info("Shutting down background services...")
-        add_ai_thought("🔌 Disconnecting services...", (200, 200, 200))
+        add_ai_thought("[SYS] Stopping services...", (200, 200, 200))
         
         async_loop.call_soon_threadsafe(async_loop.stop)
         async_thread.join(timeout=2.0)
@@ -1046,7 +1037,7 @@ def main():
             memory_manager.close()
         
         dpg.destroy_context()
-        logger.info("✓ Shutdown complete. Goodbye! 🐾")
+        logger.info("[SYS] Shutdown complete. Goodbye!")
 
 
 if __name__ == "__main__":
