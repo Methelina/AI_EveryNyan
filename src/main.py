@@ -4,10 +4,16 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.5.0
+Version:     0.6.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 
+Patch Notes v0.6.0:
+  [+] Enhanced memory reporting: detailed RAG query logs, context dump steps,
+      sliding window events, Qdrant status, DuckDB statistics.
+  [+] Added "Memory Report" button to GUI.
+  [+] Improved anti-plagiarism and anti-repetition feedback.
+  
 Patch Notes v0.5.0:
   [+] Integrated universal diary metadata schema (entities, topics, emotion, etc.)
   [+] Added metadata parsing from LLM output via DiaryEntryMetadata model
@@ -332,16 +338,18 @@ async def query_memory(query: str, top_k: int = 3,
                       filter_meta: Optional[Dict] = None) -> str:
     """
     Semantic search in Qdrant with optional metadata filtering.
-    
-    Args:
-        query: Search query
-        top_k: Number of results
-        filter_meta: Optional dict for metadata filtering, e.g., {"topics": ["food"]}
+    Reports details to UI and log.
     """
     global current_relevance_threshold
     
     if not vector_store:
+        add_ai_thought("[RAG] SKIP: Vector store not initialized", (200,150,150))
         return ""
+    
+    # Отчет о запросе
+    add_ai_thought(f"[RAG] QUERY: \"{query[:60]}{'...' if len(query)>60 else ''}\"", (180,220,255))
+    if filter_meta:
+        add_ai_thought(f"[RAG] FILTER: {filter_meta}", (180,180,200))
     
     try:
         # Build Qdrant filter if metadata filter provided
@@ -350,7 +358,6 @@ async def query_memory(query: str, top_k: int = 3,
             must_conditions = []
             for key, value in filter_meta.items():
                 if isinstance(value, list):
-                    # Match any of the values (OR logic within field)
                     must_conditions.append(
                         FieldCondition(
                             key=f"metadata.{key}",
@@ -367,18 +374,27 @@ async def query_memory(query: str, top_k: int = 3,
             if must_conditions:
                 qdrant_filter = Filter(must=must_conditions)
         
-        docs = await vector_store.asimilarity_search(
+        # Используем similarity_search_with_score для получения реальных score
+        docs_with_scores = await vector_store.asimilarity_search_with_score(
             query, k=top_k, filter=qdrant_filter
         )
         
-        if not docs:
+        if not docs_with_scores:
+            add_ai_thought(f"[RAG] RESULT: No documents found (k={top_k})", (200,150,150))
             return ""
         
+        docs = [doc for doc, _ in docs_with_scores]
+        scores = [score for _, score in docs_with_scores]
+        
+        add_ai_thought(f"[RAG] FOUND: {len(docs)} document(s) (requested {top_k})", (150,255,150))
+        
         formatted_memories = []
-        for i, doc in enumerate(docs):
-            relevance = doc.metadata.get("score", "high")
+        for i, (doc, score) in enumerate(zip(docs, scores)):
+            snippet = doc.page_content[:80].replace("\n", " ")
+            add_ai_thought(f"  [{i+1}] score={score:.3f} | {snippet}...", (200,200,200))
+            
             memory_xml = (
-                f'<memory_piece id="{i}" relatedness="{relevance}">\n'
+                f'<memory_piece id="{i}" relatedness="{score:.3f}">\n'
                 f'{doc.page_content}\n'
                 f'</memory_piece>'
             )
@@ -390,13 +406,16 @@ async def query_memory(query: str, top_k: int = 3,
         if formatted_memories:
             if len(formatted_memories) < top_k:
                 current_relevance_threshold = max(0.3, current_relevance_threshold * 0.95)
+                add_ai_thought(f"[RAG] THRESHOLD: lowered to {current_relevance_threshold:.2f}", (150,150,200))
             elif len(formatted_memories) == top_k:
                 current_relevance_threshold = min(0.9, current_relevance_threshold * 1.05)
+                add_ai_thought(f"[RAG] THRESHOLD: raised to {current_relevance_threshold:.2f}", (150,150,200))
         
         return result
         
     except Exception as e:
         logger.error(f"Memory query failed: {e}")
+        add_ai_thought(f"[RAG] ERROR: {e}", (255,100,100))
         return ""
 
 
@@ -436,55 +455,49 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
 async def dump_context_to_memory():
     """
     Smart context dumping with structured metadata parsing.
-    1. LLM writes diary entry with structured format
-    2. Parse output into DiaryEntryMetadata
-    3. Check plagiarism
-    4. Save to Qdrant (with structured payload) & DuckDB
-    5. Clear in-memory context
+    Detailed reporting on each step.
     """
     global session_context
     
     if not session_context:
         logger.info("[SYS] Context empty, nothing to dump")
-        add_ai_thought("[SYS] STATUS: Idle (no context to save)", (150, 150, 150))
+        add_ai_thought("[SYS] DUMP: idle (no context)", (150,150,150))
         return
     
-    logger.info(f"[SYS] Dumping {len(session_context)} messages to memory...")
-    add_ai_thought(f"[SUM] Processing {len(session_context)} messages...", (200, 200, 100))
+    msg_count = len(session_context)
+    logger.info(f"[SYS] Dumping {msg_count} messages to memory...")
+    add_ai_thought(f"[SUM] START: processing {msg_count} messages", (200,200,100))
+    
+    # Отчет о содержимом контекста (первые 5 сообщений)
+    for i, msg in enumerate(session_context[:5]):
+        add_ai_thought(f"  [{i}] {msg['role']}: {msg['content'][:40]}...", (150,150,180))
     
     try:
-        # 1. Format dialogue for LLM summarization
-        dialogue_text = "\n".join([
-            f"{msg['role']}: {msg['content']}" 
-            for msg in session_context
-        ])
+        dialogue_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in session_context])
         
-        # 2. Prompt LLM to write structured diary entry
         full_prompt = [
             ("system", settings.diary.summary_prompt),
             ("human", f"Here is the conversation to summarize:\n\n{dialogue_text}")
         ]
         
-        add_ai_thought("[LLM] Generating structured diary reflections...", (150, 200, 255))
+        add_ai_thought("[LLM] Generating structured diary reflections...", (150,200,255))
         response = await llm.ainvoke(full_prompt)
         diary_entry = response.content
         
-        # 3. Normalize separators and split into sections
-        diary_entry = diary_entry.replace("-- -", "---")
-        diary_entry = diary_entry.replace("- --", "---")
-        diary_entry = diary_entry.replace("----", "---")
-        
+        # Normalize separators
+        diary_entry = diary_entry.replace("-- -", "---").replace("- --", "---").replace("----", "---")
         sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         
-        saved_count = 0
         total_sections = len(sections)
-        add_ai_thought(f"[PROC] Analyzing {total_sections} sections...", (200, 180, 255))
+        add_ai_thought(f"[PROC] LLM produced {total_sections} section(s)", (200,180,255))
         
+        saved_count = 0
         for idx, section in enumerate(sections):
             if len(section) < 20:
+                add_ai_thought(f"  Section {idx+1}: skipped (too short, {len(section)} chars)", (200,150,150))
                 continue
             
-            # 4. Parse structured metadata from LLM output
+            # Parse structured metadata
             try:
                 parsed_meta = DiaryEntryMetadata.from_llm_output(
                     section,
@@ -494,31 +507,33 @@ async def dump_context_to_memory():
                         "source": "context_dump"
                     }
                 )
-                logger.debug(f"[PARSE] Metadata extracted: entities={parsed_meta.entities}, topics={parsed_meta.topics}")
+                add_ai_thought(f"  Section {idx+1}: parsed entities={parsed_meta.entities[:3]}, topics={parsed_meta.topics[:3]}", (180,220,180))
+                if parsed_meta.retrieval_cues:
+                    add_ai_thought(f"    Cues: {parsed_meta.retrieval_cues[:3]}", (180,200,180))
             except Exception as parse_e:
-                logger.warning(f"[PARSE] Fallback: using minimal metadata due to: {parse_e}")
+                logger.warning(f"[PARSE] Fallback: {parse_e}")
                 parsed_meta = DiaryEntryMetadata(
                     timestamp=datetime.now().isoformat(),
                     section=f"{idx+1}/{total_sections}",
                     source="context_dump"
                 )
+                add_ai_thought(f"  Section {idx+1}: fallback metadata (no entities/topics)", (200,150,150))
             
-            # 5. Anti-plagiarism check
-            is_duplicate = await check_plagiarism(
-                section, 
-                settings.diary.plagiarism_threshold
-            )
+            # Anti-plagiarism check
+            is_duplicate = await check_plagiarism(section, settings.diary.plagiarism_threshold)
             if is_duplicate:
+                add_ai_thought(f"  Section {idx+1}: DUPLICATE, skipped", (255,150,150))
                 continue
             
-            # 6. Save to Qdrant with structured payload
+            # Save to Qdrant
             try:
                 vector_store.add_texts(
                     texts=[section],
                     metadatas=[parsed_meta.to_qdrant_payload()]
                 )
+                add_ai_thought(f"  Section {idx+1}: written to Qdrant (dim={settings.vector_db.embedding_dim})", (150,255,150))
                 
-                # 7. Save to DuckDB with full metadata dict
+                # Save to DuckDB
                 if memory_manager:
                     memory_manager.save_diary_summary(
                         text=section,
@@ -526,28 +541,23 @@ async def dump_context_to_memory():
                         total=total_sections,
                         meta=parsed_meta
                     )
+                    add_ai_thought(f"  Section {idx+1}: written to DuckDB diary_summaries", (150,255,150))
                 
                 saved_count += 1
-                add_ai_thought(f"[MEM] WRITE: Section {idx+1}/{total_sections} OK", (150, 255, 150))
-                
             except Exception as e:
                 logger.error(f"Failed to save section {idx}: {e}")
-                continue
+                add_ai_thought(f"  Section {idx+1}: ERROR - {e}", (255,100,100))
         
-        logger.info(
-            f"[SYS] Saved {saved_count}/{total_sections} "
-            f"unique reflections to memory"
-        )
-        add_ai_thought(f"[DB] STATUS: {saved_count}/{total_sections} items stored.", (100, 255, 100))
+        logger.info(f"[SYS] Saved {saved_count}/{total_sections} unique reflections")
+        add_ai_thought(f"[DB] FINISH: {saved_count}/{total_sections} stored", (100,255,100))
         
-        # 8. Clear in-memory context
+        # Clear in-memory context
         session_context.clear()
-        logger.info("[SYS] In-memory context cleared")
-        add_ai_thought("[SYS] STATUS: Working memory cleared.", (150, 150, 150))
+        add_ai_thought("[SYS] In-memory context cleared", (150,150,150))
         
     except Exception as e:
         logger.error(f"[SYS] Failed to dump context: {e}")
-        add_ai_thought(f"[ERR] Dump failed: {e}", (255, 100, 100))
+        add_ai_thought(f"[ERR] Dump failed: {e}", (255,100,100))
 
 
 def check_anti_repetition_semantic(new_content: str) -> bool:
@@ -582,6 +592,7 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
                 f"[ANTIREPEAT] Max similarity {max_similarity:.3f} > "
                 f"{settings.anti_repeat.trigger_max}"
             )
+            add_ai_thought(f"[ANTIREPEAT] BLOCKED: max_sim={max_similarity:.2f}", (255,200,100))
             return True
         
         if avg_similarity > settings.anti_repeat.trigger_avg:
@@ -589,6 +600,7 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
                 f"[ANTIREPEAT] Avg similarity {avg_similarity:.3f} > "
                 f"{settings.anti_repeat.trigger_avg}"
             )
+            add_ai_thought(f"[ANTIREPEAT] BLOCKED: avg_sim={avg_similarity:.2f}", (255,200,100))
             return True
         
         anti_repeat_cache.append({
@@ -646,9 +658,12 @@ async def process_message(user_text: str) -> str:
     
     # Inner function for retry logic
     async def attempt_generation():
-        # 2. RAG: retrieve relevant memories with optional metadata filtering
-        # Example: filter by high-importance entries only
-        # rag_context = await query_memory(user_text, filter_meta={"importance_score": {"$gte": 0.7}})
+        # Report current context size
+        add_ai_thought(f"[CTX] Current context size: {len(session_context)} messages", (150,180,200))
+        if len(session_context) > 20:
+            add_ai_thought(f"[CTX] WARN: Large context ({len(session_context)}), may need dump soon", (255,200,100))
+        
+        # 2. RAG: retrieve relevant memories
         rag_context = await query_memory(user_text)
         
         # 3. Build system prompt
@@ -678,10 +693,8 @@ async def process_message(user_text: str) -> str:
         
     except BadRequestError as e:
         if "context length" in str(e).lower() or "exceeds" in str(e).lower():
-            logger.warning(
-                "[SYS] Context length exceeded. Initiating dump..."
-            )
-            add_ai_thought("[WARN] Context Overflow. Compressing...", (255, 150, 100))
+            logger.warning(f"[SYS] Context length exceeded (size={len(session_context)}). Dumping...")
+            add_ai_thought(f"[WARN] CONTEXT OVERFLOW: {len(session_context)} messages, threshold ~{settings.llm.token_dump_threshold} tokens", (255,150,100))
             
             # Step 1: Summarize and save old context
             await dump_context_to_memory()
@@ -689,19 +702,19 @@ async def process_message(user_text: str) -> str:
             # Step 2: Rehydrate context from DuckDB
             if memory_manager:
                 logger.info("[SYS] Rehydrating context from DuckDB...")
-                add_ai_thought("[DB] Loading recent history...", (150, 200, 255))
+                add_ai_thought("[DB] Loading recent history...", (150,200,255))
                 fresh_history = memory_manager.get_recent_history(limit=10)
                 
                 if fresh_history:
                     session_context.extend(fresh_history)
-                    logger.info(
-                        f"[SYS] Rehydrated with "
-                        f"{len(fresh_history)} messages"
-                    )
+                    logger.info(f"[SYS] Rehydrated with {len(fresh_history)} messages")
+                    add_ai_thought(f"[CTX] Rehydrated: loaded {len(fresh_history)} messages from DuckDB", (150,255,150))
+                    for msg in fresh_history:
+                        add_ai_thought(f"  -> {msg['role']}: {msg['content'][:40]}...", (150,180,200))
             
             # Step 3: Retry generation
             logger.info("[SYS] Retrying generation...")
-            add_ai_thought("[SYS] RETRY: Generating response...", (200, 200, 100))
+            add_ai_thought("[SYS] RETRY: Generating response...", (200,200,100))
             try:
                 return await attempt_generation()
             except Exception as retry_e:
@@ -712,7 +725,7 @@ async def process_message(user_text: str) -> str:
             
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
-        add_ai_thought(f"[ERR] LLM Error: {e}", (255, 100, 100))
+        add_ai_thought(f"[ERR] LLM Error: {e}", (255,100,100))
         return f"Sorry, I encountered an error: {e}"
 
 
@@ -724,10 +737,12 @@ async def save_to_memory(user_text: str, ai_response: str):
     if memory_manager:
         memory_manager.save_message("user", user_text)
         memory_manager.save_message("assistant", ai_response)
+        add_ai_thought(f"[DB] Saved dialogue (user+assistant) to chat_history", (150,200,150))
     
     # 2. Add to in-memory session context
     session_context.append({"role": "user", "content": user_text})
     session_context.append({"role": "assistant", "content": ai_response})
+    add_ai_thought(f"[CTX] Context size: {len(session_context)} messages", (150,180,200))
     
     # 3. Save to Qdrant (raw dialogue, minimal metadata)
     if vector_store:
@@ -736,9 +751,8 @@ async def save_to_memory(user_text: str, ai_response: str):
         
         if len(content) > max_chars:
             truncated = content[:max_chars].rsplit('.', 1)[0] + '.'
-            logger.debug(
-                f"Truncated dialogue from {len(content)} to {len(truncated)} chars"
-            )
+            logger.debug(f"Truncated dialogue from {len(content)} to {len(truncated)} chars")
+            add_ai_thought(f"[RAG] Dialogue truncated to {len(truncated)} chars", (200,150,150))
             content = truncated
         
         try:
@@ -749,8 +763,47 @@ async def save_to_memory(user_text: str, ai_response: str):
                     "timestamp": datetime.now().isoformat()
                 }]
             )
+            add_ai_thought(f"[RAG] Saved raw dialogue to Qdrant", (150,255,150))
         except Exception as e:
             logger.warning(f"Failed to save to Qdrant: {e}")
+            add_ai_thought(f"[RAG] ERROR saving dialogue: {e}", (255,100,100))
+
+
+# ============================================================================
+# Qdrant Status Reporting
+# ============================================================================
+
+async def report_qdrant_status():
+    """Report number of points and sample entries from Qdrant."""
+    if not qdrant_client or not settings:
+        add_ai_thought("[RAG] Status: Qdrant client not available", (200,150,150))
+        return
+    try:
+        collection_info = qdrant_client.get_collection(settings.vector_db.collection)
+        points_count = collection_info.points_count
+        add_ai_thought(f"[RAG] Qdrant collection '{settings.vector_db.collection}': {points_count} vectors", (150,255,150))
+        
+        # Get 3 most recent points (by timestamp if available, else just scroll)
+        scroll_result = qdrant_client.scroll(
+            collection_name=settings.vector_db.collection,
+            limit=3,
+            with_payload=True,
+            with_vectors=False
+        )
+        points = scroll_result[0]
+        if points:
+            add_ai_thought(f"[RAG] Latest {len(points)} entries:", (150,200,200))
+            for p in points:
+                payload = p.payload
+                # Try to get timestamp from metadata
+                ts = payload.get("metadata", {}).get("timestamp", "no timestamp")
+                text_preview = str(payload.get("page_content", ""))[:60]
+                add_ai_thought(f"  - {ts}: {text_preview}...", (180,180,180))
+        else:
+            add_ai_thought("[RAG] No points found in collection", (200,200,150))
+    except Exception as e:
+        logger.error(f"Failed to get Qdrant status: {e}")
+        add_ai_thought(f"[RAG] Status error: {e}", (255,100,100))
 
 
 # ============================================================================
@@ -785,6 +838,21 @@ def find_available_font() -> Optional[str]:
 
     logger.warning("[SYS] No preferred fonts found, using DearPyGui default")
     return None
+
+
+def on_memory_report():
+    """Callback for Memory Report button."""
+    add_ai_thought("[SYS] Generating memory report...", (200,200,100))
+    submit_to_async(report_qdrant_status())
+    if memory_manager:
+        stats = memory_manager.get_stats()
+        add_ai_thought(f"[DB] DuckDB stats: {stats.get('total_messages',0)} messages, {stats.get('total_summaries',0)} summaries", (150,255,150))
+        # Show last 3 diary summaries
+        summaries = memory_manager.get_diary_summaries(limit=3)
+        if summaries:
+            add_ai_thought(f"[DB] Last {len(summaries)} diary summaries:", (150,200,200))
+            for s in summaries:
+                add_ai_thought(f"  - {s['timestamp']}: {s['text'][:80]}...", (180,180,180))
 
 
 def setup_gui():
@@ -852,16 +920,17 @@ def setup_gui():
         with dpg.child_window(tag="ai_thoughts_area", height=120, label="[SYSTEM] LOG", border=True):
             dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100, 100, 100))
         
-        # Input area
+        # Input area with Memory Report button
         with dpg.group(horizontal=True):
             dpg.add_input_text(
                 tag="user_input",
-                width=-100,
+                width=-180,
                 hint="Type your message...",
                 on_enter=True,
                 callback=on_send_message
             )
             dpg.add_button(label="Send", callback=on_send_message, width=80)
+            dpg.add_button(label="Memory Report", callback=on_memory_report, width=100)
         
         # Status indicator
         dpg.add_text("", tag="status_text", color=(100, 100, 100))
@@ -978,7 +1047,7 @@ def signal_handler(signum, frame):
 def main():
     global settings, async_loop, async_thread
     
-    logger.info(f"Starting AI_EveryNyan v0.5.0 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.6.0 (debug={settings.debug})")
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
