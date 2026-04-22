@@ -42,12 +42,24 @@ from pydantic_settings import BaseSettings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
-from qdrant_client.http.models import ScoredPoint, Filter, FieldCondition, MatchValue, MatchAny
+from qdrant_client.http.models import (
+    ScoredPoint,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    MatchAny,
+)
 from openai import BadRequestError, APITimeoutError, AsyncOpenAI
 
 # LangChain Core Imports for the Custom Model
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, AIMessageChunk
+from langchain_core.messages import (
+    BaseMessage,
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    AIMessageChunk,
+)
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
 
@@ -161,8 +173,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/app.log", encoding="utf-8", mode="a")
-    ]
+        logging.FileHandler("logs/app.log", encoding="utf-8", mode="a"),
+    ],
 )
 logger = logging.getLogger("AI_EveryNyan")
 
@@ -249,9 +261,11 @@ class AppSettings(BaseSettings):
     rag: RAGSettings = Field(default_factory=RAGSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     debug: bool = False
-    
-    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-    
+
+    model_config = ConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
     @classmethod
     def from_yaml(cls, path: str) -> "AppSettings":
         try:
@@ -275,10 +289,26 @@ class AppSettings(BaseSettings):
             logger.warning("Custom embedding mode not implemented, falling back to ollama")
             return self.ollama
 
+    def get_chat_config(self):
+        if self.chat_mode == "ollama":
+            return self.ollama
+        else:
+            return self.llama
+
+    def get_embedding_config(self):
+        if self.embedding_mode == "ollama":
+            return self.ollama
+        else:
+            logger.warning(
+                "Custom embedding mode not implemented, falling back to ollama"
+            )
+            return self.ollama
+
 
 # ============================================================================
 # Character Configuration
 # ============================================================================
+
 
 class CharacterBaseConfig(BaseModel):
     meta: dict = Field(default_factory=dict)
@@ -293,7 +323,7 @@ class CharacterAppearanceConfig(BaseModel):
 class CharacterConfig:
     BASE_PATH = Path("config/character/base.yaml")
     APPEARANCE_PATH = Path("config/character/appearance.yaml")
-    
+
     @staticmethod
     def _load_yaml_file(filepath: Path, model: type[BaseModel]) -> BaseModel:
         if not filepath.exists():
@@ -305,11 +335,11 @@ class CharacterConfig:
         except Exception as e:
             logger.error(f"Error loading {filepath}: {e}")
             raise
-    
+
     @classmethod
     def load_base(cls) -> CharacterBaseConfig:
         return cls._load_yaml_file(cls.BASE_PATH, CharacterBaseConfig)
-    
+
     @classmethod
     def load_appearance(cls) -> CharacterAppearanceConfig:
         return cls._load_yaml_file(cls.APPEARANCE_PATH, CharacterAppearanceConfig)
@@ -328,6 +358,9 @@ vector_store: Optional[QdrantVectorStore] = None
 llm = None
 embeddings: Optional[OpenAIEmbeddings] = None
 memory_manager: Optional[MemoryManager] = None
+mcp_client = None
+react_agent = None
+
 query_preprocessor: Optional[QueryPreprocessor] = None
 
 session_context: List[Dict[str, str]] = []
@@ -343,6 +376,7 @@ _current_ai_message_tag = None
 # ============================================================================
 # AI Thoughts UI System
 # ============================================================================
+
 
 def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
     logger.info(f"[AI_THOUGHT] {text}")
@@ -380,9 +414,11 @@ def finalize_ai_message_streaming():
 # Async Helpers
 # ============================================================================
 
+
 def run_async_loop(loop: asyncio.AbstractEventLoop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
 
 def submit_to_async(coro) -> asyncio.Future:
     if async_loop is None or not async_loop.is_running():
@@ -394,6 +430,7 @@ def submit_to_async(coro) -> asyncio.Future:
 # ============================================================================
 # Component Initialization
 # ============================================================================
+
 
 def init_components():
     global qdrant_client, vector_store, llm, embeddings
@@ -411,9 +448,8 @@ def init_components():
         qdrant_client.create_collection(
             collection_name=settings.vector_db.collection,
             vectors_config=models.VectorParams(
-                size=settings.vector_db.embedding_dim,
-                distance=models.Distance.COSINE
-            )
+                size=settings.vector_db.embedding_dim, distance=models.Distance.COSINE
+            ),
         )
         logger.info(f"Created collection: {settings.vector_db.collection}")
     
@@ -424,7 +460,7 @@ def init_components():
         openai_api_base=embed_cfg.base_url,
         check_embedding_ctx_length=False,
     )
-    
+
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=settings.vector_db.collection,
@@ -470,7 +506,70 @@ def init_memory_manager():
     global memory_manager
     memory_manager = MemoryManager()
     stats = memory_manager.get_stats()
-    logger.info(f"MemoryManager initialized. Messages: {stats.get('total_messages', 0)}")
+    logger.info(
+        f"MemoryManager initialized. Messages: {stats.get('total_messages', 0)}"
+    )
+
+
+def init_query_preprocessor():
+    global query_preprocessor
+    query_preprocessor = QueryPreprocessor(add_thought_callback=add_ai_thought)
+    logger.info("QueryPreprocessor initialized (spaCy lemmatization).")
+
+
+def _to_lc_messages(raw_msgs: list[dict]) -> list:
+    result = []
+    for m in raw_msgs:
+        role, content = m["role"], m["content"]
+        if role == "user":
+            result.append(HumanMessage(content=content))
+        elif role == "assistant":
+            result.append(AIMessage(content=content))
+        else:
+            result.append(SystemMessage(content=content))
+    return result
+
+
+async def init_mcp_agent():
+    global mcp_client, react_agent
+    try:
+        # Ensure project root is importable (for tools.mcp package)
+        project_root = str(Path(__file__).resolve().parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            from langgraph.prebuilt import create_react_agent
+        from tools.mcp import return_mcp_client
+
+        searxng_url = getattr(settings, "searxng_url", "http://localhost:2597")
+        mcp_client = return_mcp_client(SEARXNG_URL=searxng_url)
+
+        tools = await mcp_client.get_tools()
+        if tools:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning)
+                react_agent = create_react_agent(
+                    model=llm,
+                    tools=tools,
+                )
+            tool_names = [t.name for t in tools]
+            logger.info(f"[MCP] React agent initialized with tools: {tool_names}")
+            add_ai_thought(
+                f"[MCP] Agent ready: {len(tools)} tool(s) loaded ({', '.join(tool_names)})",
+                (100, 200, 255),
+            )
+        else:
+            logger.info("[MCP] No MCP tools discovered, running without tool support")
+            add_ai_thought("[MCP] No tools found (standalone mode)", (200, 200, 150))
+    except Exception as e:
+        logger.warning(f"[MCP] Failed to initialize MCP agent: {e}")
+        add_ai_thought(f"[MCP] Init skipped: {e}", (255, 200, 100))
+        mcp_client = None
+        react_agent = None
 
 
 def init_query_preprocessor():
@@ -488,7 +587,7 @@ async def query_memory(query: str, top_k: Optional[int] = None,
     if top_k is None:
         top_k = settings.rag.top_k
     if not vector_store:
-        add_ai_thought("[RAG] SKIP: Vector store not initialized", (200,150,150))
+        add_ai_thought("[RAG] SKIP: Vector store not initialized", (200, 150, 150))
         return ""
 
     add_ai_thought(f"[RAG] QUERY: \"{query[:60]}{'...' if len(query)>60 else ''}\" (k={top_k})", (180,220,255))
@@ -509,14 +608,19 @@ async def query_memory(query: str, top_k: Optional[int] = None,
 
         docs_with_scores = await vector_store.asimilarity_search_with_score(query, k=top_k, filter=qdrant_filter)
         if not docs_with_scores:
-            add_ai_thought(f"[RAG] RESULT: No documents found (k={top_k})", (200,150,150))
+            add_ai_thought(
+                f"[RAG] RESULT: No documents found (k={top_k})", (200, 150, 150)
+            )
             return ""
 
         if settings.rag.similarity_threshold > 0:
             docs_with_scores = [(doc, score) for doc, score in docs_with_scores
                                 if score >= settings.rag.similarity_threshold]
             if not docs_with_scores:
-                add_ai_thought(f"[RAG] RESULT: No documents above threshold {settings.rag.similarity_threshold}", (200,150,150))
+                add_ai_thought(
+                    f"[RAG] RESULT: No documents above threshold {settings.rag.similarity_threshold}",
+                    (200, 150, 150),
+                )
                 return ""
 
         docs = [doc for doc, _ in docs_with_scores]
@@ -533,7 +637,35 @@ async def query_memory(query: str, top_k: Optional[int] = None,
         return "\n\n".join(formatted_memories)
     except Exception as e:
         logger.error(f"Memory query failed: {e}")
-        add_ai_thought(f"[RAG] ERROR: {e}", (255,100,100))
+        add_ai_thought(f"[RAG] ERROR: {e}", (255, 100, 100))
+        return ""
+
+
+async def keyword_search_in_history(query: str, limit: int = 3) -> str:
+    if not memory_manager:
+        return ""
+    keywords = [w for w in query.lower().split() if len(w) > 3]
+    if not keywords:
+        return ""
+    try:
+        conn = memory_manager.conn
+        conditions = " OR ".join([f"LOWER(content) LIKE '%{kw}%'" for kw in keywords])
+        rows = conn.execute(
+            f"""
+            SELECT role, content, timestamp FROM chat_history
+            WHERE {conditions} ORDER BY timestamp DESC LIMIT ?
+        """,
+            [limit],
+        ).fetchall()
+        if not rows:
+            return ""
+        result_parts = []
+        for role, content, ts in rows:
+            sender = "User" if role == "user" else "AI"
+            result_parts.append(f"[{ts}] {sender}: {content[:300]}")
+        return "\n\n".join(result_parts)
+    except Exception as e:
+        logger.warning(f"Keyword search failed: {e}")
         return ""
 
 
@@ -572,7 +704,7 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
             query=query_vector,
             limit=1,
             with_payload=False,
-            with_vectors=False
+            with_vectors=False,
         ).points
         if results and results[0].score > threshold:
             add_ai_thought(f"[MEM] BLOCK: Duplicate (sim={results[0].score:.2f})", (255,150,150))
@@ -728,6 +860,7 @@ def build_system_prompt() -> str:
 # Message Processing (UNIFIED LOGIC v0.16.1 with FIX)
 # ============================================================================
 
+
 async def process_message(user_text: str) -> str:
     global session_context
 
@@ -762,19 +895,39 @@ async def process_message(user_text: str) -> str:
             messages.append(AIMessage(content=f"Я вспоминаю:\n{rag_context}"))
 
         max_hist = settings.context.max_history_messages
-        recent = session_context[-max_hist:] if len(session_context) > max_hist else session_context
-        
+        recent = (
+            session_context[-max_hist:]
+            if len(session_context) > max_hist
+            else session_context
+        )
+
         for msg in recent:
-            if msg['role'] == 'user':
-                messages.append(HumanMessage(content=msg['content']))
-            elif msg['role'] == 'assistant':
-                messages.append(AIMessage(content=msg['content']))
-        
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+
         messages.append(HumanMessage(content=user_text))
 
         content = ""
-        
-        if settings.chat_mode == "ollama":
+
+        if react_agent:
+            add_ai_thought("[MCP] Using react agent with tools", (100, 200, 255))
+            result = await react_agent.ainvoke({"messages": messages})
+            content = result["messages"][-1].content
+            final_msg = result["messages"][-1]
+            reasoning = ""
+            if hasattr(final_msg, "additional_kwargs"):
+                reasoning = (
+                    final_msg.additional_kwargs.get("reasoning_content", "") or ""
+                )
+            if not reasoning and hasattr(final_msg, "response_metadata"):
+                reasoning = (
+                    final_msg.response_metadata.get("reasoning_content", "") or ""
+                )
+            if reasoning:
+                add_ai_thought(f"[REASONING]\n{reasoning}", (180, 180, 150))
+        elif settings.chat_mode == "ollama":
             response = await llm.ainvoke(messages)
             content = response.content
             reasoning = response.response_metadata.get("reasoning_content", "") or ""
@@ -861,6 +1014,7 @@ async def save_to_memory(user_text: str, ai_response: str):
 # ============================================================================
 # GUI
 # ============================================================================
+
 
 async def report_qdrant_status():
     if not qdrant_client:
@@ -999,6 +1153,7 @@ async def handle_async_response(user_text: str):
 # Graceful Shutdown
 # ============================================================================
 
+
 def initiate_graceful_shutdown():
     global _shutting_down
     if _shutting_down:
@@ -1009,7 +1164,9 @@ def initiate_graceful_shutdown():
     dpg.set_value("status_text", "Saving memories...")
     if session_context:
         try:
-            future = asyncio.run_coroutine_threadsafe(dump_context_to_memory(), async_loop)
+            future = asyncio.run_coroutine_threadsafe(
+                dump_context_to_memory(), async_loop
+            )
             future.result(timeout=30)
             add_ai_thought("[SYS] STATUS: Save complete.", (150,255,150))
         except Exception as e:
@@ -1025,6 +1182,7 @@ def signal_handler(signum, frame):
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+
 
 def main():
     global settings, async_loop, async_thread
@@ -1044,23 +1202,35 @@ def main():
     init_character()
 
     async_loop = asyncio.new_event_loop()
-    async_thread = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
+    async_thread = threading.Thread(
+        target=run_async_loop, args=(async_loop,), daemon=True
+    )
     async_thread.start()
 
     setup_gui()
     init_query_preprocessor()
-    add_ai_thought("[SYS] STATUS: Online. Ready.", (100,255,100))
+
+    future = asyncio.run_coroutine_threadsafe(init_mcp_agent(), async_loop)
+    try:
+        future.result(timeout=30)
+    except Exception as e:
+        logger.warning(f"[MCP] Agent initialization failed: {e}")
+    add_ai_thought("[SYS] STATUS: Online. Ready.", (100, 255, 100))
 
     try:
         dpg.start_dearpygui()
     finally:
-        add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255,150,150))
+        add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255, 150, 150))
         if session_context:
             try:
-                future = asyncio.run_coroutine_threadsafe(dump_context_to_memory(), async_loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    dump_context_to_memory(), async_loop
+                )
                 future.result(timeout=300)
             except Exception as e:
                 logger.error(f"Final dump failed: {e}")
+        if mcp_client:
+            logger.info("[MCP] Client released (no explicit close needed)")
         async_loop.call_soon_threadsafe(async_loop.stop)
         async_thread.join(timeout=2.0)
         if memory_manager:
