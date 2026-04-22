@@ -529,7 +529,7 @@ def _to_lc_messages(raw_msgs: list[dict]) -> list:
             result.append(SystemMessage(content=content))
     return result
 
-
+# import traceback
 async def init_mcp_agent():
     global mcp_client, react_agent
     try:
@@ -570,7 +570,6 @@ async def init_mcp_agent():
         add_ai_thought(f"[MCP] Init skipped: {e}", (255, 200, 100))
         mcp_client = None
         react_agent = None
-
 
 def init_query_preprocessor():
     global query_preprocessor
