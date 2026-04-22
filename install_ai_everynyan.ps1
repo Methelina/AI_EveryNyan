@@ -6,27 +6,14 @@
     Идемпотентен: безопасен для повторного запуска.
 
     \install_ai_everynyan.ps1
-    Version: 0.5.0
+    Version: 0.6.0
     Author: Soror L.'.L.'.
-    Updated: 2026-04-22
+    Updated: 2026-04-23
 
-    Patchnote v0.5.0:
-      [!!!] КРИТИЧЕСКОЕ ОБНОВЛЕНИЕ: генерация settings.yaml полностью переработана
-            под новую структуру (ollama/llama секции, chat_mode, embedding_mode,
-            rag, context, anti_repeat, diary с summary_prompt и т.д.)
-      [+] Добавлен блок anti_repeat с параметрами trigger_avg, trigger_max, max_history
-      [+] Добавлен блок context с max_history_messages, warn_if_context_exceeds
-      [+] Добавлен блок rag с top_k, similarity_threshold, enable_metadata_filtering
-      [+] В секции ollama добавлены timeout, temperature, max_tokens, token_dump_threshold
-      [+] В секции llama добавлены timeout, temperature, max_tokens, token_dump_threshold
-      [+] Добавлена настройка embedding_mode (отдельно от chat_mode)
-      [+] Добавлен блок gui с title, width, height, theme
-      [+] Добавлен блок logging с level, file
-      [+] Добавлен параметр debug
-      [*] Исправлено: embedding_model теперь указывается как "bge-m3:latest" (с тегом)
-      [*] Исправлено: embedding_dim по умолчанию 1024 (соответствует bge-m3)
-      [*] Улучшена проверка установки модели bge-m3 (учитывает тег)
-      [*] Версия инсталлятора повышена до 0.5.0
+    Patchnote v0.6.0:
+      [+] Добавлены проверки импортов для всех новых зависимостей из requirements.txt
+          (aiohttp, httpx, duckdb, langchain*, openai, fastmcp, markdownify, langgraph и др.)
+      [*] Версия инсталлятора повышена до 0.6.0
 #>
 
 # === Настройка кодировки ===
@@ -209,7 +196,7 @@ debug: false
 # === Основной процесс ===
 
 Write-Status "╔════════════════════════════════════════╗" "INFO"
-Write-Status "║  AI_EveryNyan Installer v0.5.0         ║" "INFO"
+Write-Status "║  AI_EveryNyan Installer v0.6.0         ║" "INFO"
 Write-Status "╚════════════════════════════════════════╝" "INFO"
 
 # 1. Проверка зависимостей
@@ -367,9 +354,37 @@ if (Test-SpacyModel -ModelName $enModel) {
     }
 }
 
-# 7. Проверка критических импортов
+# 7. Проверка критических импортов (включая все новые зависимости)
 Write-Status "`n[7/7] Проверка критических импортов..." "INFO"
-$Modules = @("dearpygui.dearpygui", "langchain_core", "qdrant_client", "pydantic", "asyncio", "spacy")
+
+$Modules = @(
+    # Основные библиотеки
+    "dearpygui.dearpygui",
+    "langchain_core",
+    "qdrant_client",
+    "pydantic",
+    "asyncio",
+    "spacy",
+    # Новые зависимости из requirements.txt
+    "aiohttp",
+    "httpx",
+    "duckdb",
+    "langchain",
+    "langchain_community",
+    "langchain_qdrant",
+    "langchain_openai",
+    "openai",
+    "pydantic_settings",
+    "dotenv",           # python-dotenv
+    "structlog",
+    "yaml",             # PyYAML
+    "tqdm",
+    "fastmcp",
+    "markdownify",
+    "langchain_mcp_adapters",
+    "langgraph"
+)
+
 $AllOK = $true
 foreach ($mod in $Modules) {
     & $PythonExe -c "import $mod" 2>$null
@@ -403,9 +418,10 @@ Write-Status "╚═════════════════════
 Write-Status "" "INFO"
 Write-Status "Следующие шаги:" "INFO"
 Write-Status "  1. Убедитесь, что внешние запускаторы (run_ai_everynyan.bat, run_qdrant.bat) присутствуют в корне проекта" "INFO"
-Write-Status "  2. Запустите Qdrant (docker run -p 6333:6333 qdrant/qdrant)" "INFO"
+Write-Status "  2. Запустите Qdrant (run_qdrant.bat)" "INFO"
 Write-Status "  3. Запустите Ollama (ollama serve)" "INFO"
-Write-Status "  4. Запустите приложение через run_ai_everynyan.bat" "INFO"
+Write-Status "  4. Запустите SearXNG (run_searxng.bat)" "INFO"
+Write-Status "  5. Запустите приложение через run_ai_everynyan.bat" "INFO"
 Write-Status "" "INFO"
 Write-Status "Конфиг: $ConfigPath\settings.yaml" "INFO"
 Write-Status "Логи:   $LogsPath\install.log" "INFO"
