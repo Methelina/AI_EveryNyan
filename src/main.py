@@ -4,26 +4,22 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.13.0
+Version:     0.16.1
 Author:      Soror L.'.L.'.
-Updated:     2026-04-21
+Updated:     2026-04-22
 
-Patch Notes v0.13.0:
-  [+] Split LLM configuration: separate settings for chat and embeddings.
-  [+] Added chat_mode and embedding_mode in settings.yaml.
-  [+] Embeddings can now use Ollama while chat uses external LLaMA server.
-  [+] Improved flexibility for mixed backend setups.
+Patch Notes v0.16.1:
+  [FIX] Critical bug in LLaMA mode: process_message returned None
+        because inner function attempt_generation() missed 'return content'.
+  [FIX] Now AI response is properly saved to memory and displayed.
 
-Previous versions:
-  v0.12.0: unified LLM config with mode selection.
-  v0.11.0: lemmatization moved to indexing, search uses original query.
-  v0.10.1: fixed GUI initialization order.
-  v0.10.0: added QueryPreprocessor with lemmatization.
-  v0.9.0: metadata extraction for dialogues, fixed embedding normalize bug.
-  v0.8.0: plain text RAG, DuckDB keyword fallback, auto-load history.
-  v0.7.0: moved parameters to settings.yaml, JSON metadata, circumplex affect.
-  v0.6.0: detailed memory reporting, Memory Report button.
-  v0.5.0: universal diary metadata schema, Qdrant payload filtering.
+Patch Notes v0.16.0:
+  [+] REFACTOR: Replaced custom LlamaAdapter with LangChain-native LlamaChatModel.
+  [+] FEATURE: Unified prompt handling using LangChain Messages (System/Human/AI).
+  [+] FIX: Removed manual string concatenation for prompts (less bugs, better formatting).
+  [+] IMPROVE: Integrated streaming support directly into the LangChain pipeline.
+  [+] FIX: Handled empty API keys gracefully (defaults to "not-needed" for local servers).
+  [+] CLEANUP: Removed obsolete LlamaAdapter class and manual JSON parsing logic.
 """
 
 import os
@@ -35,8 +31,9 @@ import signal
 import json
 import yaml
 import re
+import requests
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Union, Literal
+from typing import Optional, List, Dict, Any, Tuple, Union, Literal, Callable
 from datetime import datetime
 
 import dearpygui.dearpygui as dpg
@@ -46,11 +43,114 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import ScoredPoint, Filter, FieldCondition, MatchValue, MatchAny
-from openai import BadRequestError
+from openai import BadRequestError, APITimeoutError, AsyncOpenAI
+
+# LangChain Core Imports for the Custom Model
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
 
 # Local imports
 from memory_manager import MemoryManager, DiaryEntryMetadata
 from query_preprocessor import QueryPreprocessor
+
+# ============================================================================
+# LlamaChatModel (Native LangChain Adapter - FIXED v2)
+# ============================================================================
+
+class LlamaChatModel(BaseChatModel):
+    """
+    LangChain-compatible adapter for local LLaMA/OpenAI-compatible servers.
+    Supports streaming and reasoning_content extraction.
+    """
+    
+    base_url: str = Field(default="http://127.0.0.1:8088/v1")
+    model: str = Field(default="Falcon-H1R-7B-Q8_0.gguf")
+    api_key: str = Field(default="not-needed")
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    timeout: int = 180
+    
+    _client: Any = None
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout
+        )
+    
+    @property
+    def _llm_type(self) -> str:
+        return "llama-chat"
+    
+    def _convert_messages(self, messages: List[BaseMessage]) -> List[Dict]:
+        """LangChain messages -> OpenAI format."""
+        result = []
+        for m in messages:
+            if isinstance(m, SystemMessage):
+                result.append({"role": "system", "content": m.content})
+            elif isinstance(m, HumanMessage):
+                result.append({"role": "user", "content": m.content})
+            elif isinstance(m, AIMessage):
+                result.append({"role": "assistant", "content": m.content})
+            else:
+                result.append({"role": "user", "content": m.content})
+        return result
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        """Синхронная обертка (обязательна)."""
+        return asyncio.run(self._agenerate(messages, stop, run_manager, **kwargs))
+
+    async def _astream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ):
+        """Генератор для стриминга."""
+        openai_messages = self._convert_messages(messages)
+        
+        stream = await self._client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=True,
+            **kwargs
+        )
+        
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            content = delta.content or ""
+            reasoning = getattr(delta, 'reasoning_content', "") or ""
+            
+            lc_chunk = ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=content, 
+                    additional_kwargs={"reasoning_content": reasoning}
+                )
+            )
+            yield lc_chunk
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        """Обычный вызов (собирает стрим в кучу)."""
+        result_content = ""
+        result_reasoning = ""
+        async for chunk in self._astream(messages, stop, run_manager, **kwargs):
+            result_content += chunk.message.content
+            if "reasoning_content" in chunk.message.additional_kwargs:
+                result_reasoning += chunk.message.additional_kwargs["reasoning_content"]
+        
+        ai_message = AIMessage(
+            content=result_content,
+            additional_kwargs={"reasoning_content": result_reasoning}
+        )
+        return ChatResult(generations=[ChatGeneration(message=ai_message)])
+
 
 # ============================================================================
 # Logging Configuration
@@ -83,14 +183,13 @@ class OllamaSettings(BaseModel):
 
 
 class LlamaSettings(BaseModel):
-    base_url: str = "http://localhost:8080/v1"
+    base_url: str = "http://localhost:8088/v1"
     api_key: str = ""
-    chat_model: str = "meta-llama/Llama-2-7b-chat-hf"
+    chat_model: str = "Falcon-H1R-7B-Q8_0.gguf"
     timeout: int = 180
     temperature: float = 0.7
     max_tokens: int = 4096
     token_dump_threshold: int = 20000
-    # embedding_model not used for llama (embeddings come from Ollama or separate)
 
 
 class QdrantSettings(BaseModel):
@@ -136,15 +235,12 @@ class ContextSettings(BaseModel):
 
 
 class AppSettings(BaseSettings):
-    # Mode selectors
     chat_mode: Literal["ollama", "llama"] = "ollama"
-    embedding_mode: Literal["ollama", "custom"] = "ollama"  # custom not implemented yet, falls back to ollama
+    embedding_mode: Literal["ollama", "custom"] = "ollama"
     
-    # Backend configurations
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     llama: LlamaSettings = Field(default_factory=LlamaSettings)
     
-    # Other sections
     vector_db: QdrantSettings = Field(default_factory=QdrantSettings)
     diary: DiarySettings = Field(default_factory=DiarySettings)
     gui: GUISettings = Field(default_factory=GUISettings)
@@ -167,19 +263,15 @@ class AppSettings(BaseSettings):
             raise
     
     def get_chat_config(self):
-        """Return active chat LLM configuration."""
         if self.chat_mode == "ollama":
             return self.ollama
         else:
             return self.llama
     
     def get_embedding_config(self):
-        """Return active embedding configuration."""
         if self.embedding_mode == "ollama":
             return self.ollama
         else:
-            # For custom embedding servers, you would extend this.
-            # Fallback to ollama for now.
             logger.warning("Custom embedding mode not implemented, falling back to ollama")
             return self.ollama
 
@@ -233,7 +325,7 @@ character_appearance: Optional[CharacterAppearanceConfig] = None
 
 qdrant_client: Optional[QdrantClient] = None
 vector_store: Optional[QdrantVectorStore] = None
-llm: Optional[ChatOpenAI] = None
+llm = None
 embeddings: Optional[OpenAIEmbeddings] = None
 memory_manager: Optional[MemoryManager] = None
 query_preprocessor: Optional[QueryPreprocessor] = None
@@ -245,10 +337,11 @@ async_loop: Optional[asyncio.AbstractEventLoop] = None
 async_thread: Optional[threading.Thread] = None
 
 _shutting_down: bool = False
+_current_ai_message_tag = None
 
 
 # ============================================================================
-# AI Thoughts UI System (with console logging)
+# AI Thoughts UI System
 # ============================================================================
 
 def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
@@ -263,6 +356,24 @@ def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
         dpg.set_y_scroll("ai_thoughts_area", 1e9)
     except Exception as e:
         logger.debug(f"Thought UI update skipped: {e}")
+
+
+def update_ai_message_streaming(text: str):
+    global _current_ai_message_tag
+    if _current_ai_message_tag and dpg.does_item_exist(_current_ai_message_tag):
+        dpg.set_value(_current_ai_message_tag, text)
+    else:
+        with dpg.group(parent="chat_area", horizontal=False):
+            with dpg.group(horizontal=True):
+                dpg.add_text("AI_EveryNyan:", color=(255,200,100))
+            with dpg.group(indent=20):
+                _current_ai_message_tag = dpg.add_text(text, wrap=max(200, dpg.get_viewport_width()-150))
+        dpg.set_y_scroll("chat_area", 1e9)
+
+
+def finalize_ai_message_streaming():
+    global _current_ai_message_tag
+    _current_ai_message_tag = None
 
 
 # ============================================================================
@@ -306,7 +417,7 @@ def init_components():
         )
         logger.info(f"Created collection: {settings.vector_db.collection}")
     
-    # Embeddings (could be from Ollama or another OpenAI-compatible server)
+    # Embeddings
     embeddings = OpenAIEmbeddings(
         model=embed_cfg.embedding_model,
         openai_api_key=embed_cfg.api_key,
@@ -320,16 +431,30 @@ def init_components():
         embedding=embeddings
     )
     
-    # Chat LLM
-    llm = ChatOpenAI(
-        model=chat_cfg.chat_model,
-        openai_api_key=chat_cfg.api_key,
-        openai_api_base=chat_cfg.base_url,
-        temperature=chat_cfg.temperature,
-        timeout=chat_cfg.timeout,
-        max_tokens=chat_cfg.max_tokens,
-        streaming=False
-    )
+    # LLM Initialization (Updated for v0.16.0)
+    if settings.chat_mode == "ollama":
+        llm = ChatOpenAI(
+            model=chat_cfg.chat_model,
+            openai_api_key=chat_cfg.api_key,
+            openai_api_base=chat_cfg.base_url,
+            temperature=chat_cfg.temperature,
+            timeout=chat_cfg.timeout,
+            max_tokens=chat_cfg.max_tokens,
+            streaming=False
+        )
+        logger.info("LLM initialized as ChatOpenAI (Ollama mode)")
+    else:
+        api_key_to_use = chat_cfg.api_key if chat_cfg.api_key else "not-needed"
+        llm = LlamaChatModel(
+            base_url=chat_cfg.base_url,
+            model=chat_cfg.chat_model,
+            api_key=api_key_to_use,
+            timeout=chat_cfg.timeout,
+            temperature=chat_cfg.temperature,
+            max_tokens=chat_cfg.max_tokens
+        )
+        logger.info("LLM initialized as LlamaChatModel (Native LangChain)")
+    
     logger.info("Components initialized")
 
 
@@ -358,19 +483,18 @@ def init_query_preprocessor():
 # RAG & Memory Management
 # ============================================================================
 
-async def query_memory(query: str, top_k: Optional[int] = None, 
+async def query_memory(query: str, top_k: Optional[int] = None,
                       filter_meta: Optional[Dict] = None) -> str:
-    """Semantic search in Qdrant with plain text output."""
     if top_k is None:
         top_k = settings.rag.top_k
     if not vector_store:
         add_ai_thought("[RAG] SKIP: Vector store not initialized", (200,150,150))
         return ""
-    
+
     add_ai_thought(f"[RAG] QUERY: \"{query[:60]}{'...' if len(query)>60 else ''}\" (k={top_k})", (180,220,255))
     if filter_meta:
         add_ai_thought(f"[RAG] FILTER: {filter_meta}", (180,180,200))
-    
+
     try:
         qdrant_filter = None
         if filter_meta and settings.rag.enable_metadata_filtering:
@@ -382,30 +506,30 @@ async def query_memory(query: str, top_k: Optional[int] = None,
                     must_conditions.append(FieldCondition(key=f"metadata.{key}", match=MatchValue(value=value)))
             if must_conditions:
                 qdrant_filter = Filter(must=must_conditions)
-        
+
         docs_with_scores = await vector_store.asimilarity_search_with_score(query, k=top_k, filter=qdrant_filter)
         if not docs_with_scores:
             add_ai_thought(f"[RAG] RESULT: No documents found (k={top_k})", (200,150,150))
             return ""
-        
+
         if settings.rag.similarity_threshold > 0:
-            docs_with_scores = [(doc, score) for doc, score in docs_with_scores 
+            docs_with_scores = [(doc, score) for doc, score in docs_with_scores
                                 if score >= settings.rag.similarity_threshold]
             if not docs_with_scores:
                 add_ai_thought(f"[RAG] RESULT: No documents above threshold {settings.rag.similarity_threshold}", (200,150,150))
                 return ""
-        
+
         docs = [doc for doc, _ in docs_with_scores]
         scores = [score for _, score in docs_with_scores]
         add_ai_thought(f"[RAG] FOUND: {len(docs)} document(s) (requested {top_k})", (150,255,150))
-        
+
         formatted_memories = []
         for i, (doc, score) in enumerate(zip(docs, scores)):
             snippet = doc.page_content[:80].replace("\n", " ")
             add_ai_thought(f"  [{i+1}] score={score:.3f} | {snippet}...", (200,200,200))
             content = doc.page_content[:800]
             formatted_memories.append(f"--- Воспоминание {i+1} (релевантность {score:.2f}) ---\n{content}")
-        
+
         return "\n\n".join(formatted_memories)
     except Exception as e:
         logger.error(f"Memory query failed: {e}")
@@ -413,7 +537,6 @@ async def query_memory(query: str, top_k: Optional[int] = None,
         return ""
 
 
-# ---------- DuckDB keyword fallback ----------
 async def keyword_search_in_history(query: str, limit: int = 3) -> str:
     if not memory_manager:
         return ""
@@ -439,7 +562,6 @@ async def keyword_search_in_history(query: str, limit: int = 3) -> str:
         return ""
 
 
-# ---------- Plagiarism check ----------
 async def check_plagiarism(text: str, threshold: float) -> bool:
     if not vector_store or not qdrant_client:
         return False
@@ -461,8 +583,11 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
         return False
 
 
-# ---------- Metadata extraction for dialogues ----------
 async def _extract_dialogue_metadata(user_text: str, ai_response: str) -> Dict[str, Any]:
+    # Works with both ChatOpenAI and LlamaChatModel as both support ainvoke
+    if settings.chat_mode != "ollama":
+        # Для локальных моделей можно пропустить сложное извлечение, если нет инструкций
+        return {"entities": [], "topics": [], "key_facts": []}
     prompt = f"""
 Extract metadata from this conversation:
 User: {user_text[:500]}
@@ -477,7 +602,7 @@ Output ONLY valid JSON, no extra text.
 """
     try:
         response = await llm.ainvoke([("system", "You are a metadata extractor. Output only JSON."), ("human", prompt)])
-        content = response.content.strip()
+        content = response.content
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
@@ -491,7 +616,6 @@ Output ONLY valid JSON, no extra text.
     return {"entities": [], "topics": [], "key_facts": []}
 
 
-# ---------- Smart context dumping (with lemmatized copy) ----------
 async def dump_context_to_memory():
     global session_context
     if not session_context:
@@ -504,8 +628,15 @@ async def dump_context_to_memory():
     try:
         dialogue_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in session_context])
         full_prompt = [("system", settings.diary.summary_prompt), ("human", f"Here is the conversation to summarize:\n\n{dialogue_text}")]
-        response = await llm.ainvoke(full_prompt)
-        diary_entry = response.content
+        
+        if settings.chat_mode == "ollama":
+            response = await llm.ainvoke(full_prompt)
+            diary_entry = response.content
+        else:
+            # Unified approach using ainvoke for LlamaChatModel too
+            response = await llm.ainvoke(full_prompt)
+            diary_entry = response.content
+            
         diary_entry = diary_entry.replace("-- -", "---").replace("- --", "---").replace("----", "---")
         sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         total_sections = len(sections)
@@ -513,7 +644,6 @@ async def dump_context_to_memory():
         for idx, section in enumerate(sections):
             if len(section) < 20:
                 continue
-            
             json_str = "{}"
             json_block = re.search(r'```json\s*(\{.*?\})\s*```', section, re.DOTALL)
             if json_block:
@@ -524,7 +654,6 @@ async def dump_context_to_memory():
                 if json_match:
                     json_str = json_match.group(1)
                     section = section.replace(json_str, "").strip()
-            
             clean_section = section[:500] if section else "No content"
             base_meta = {"timestamp": datetime.now().isoformat(), "section": f"{idx+1}/{total_sections}", "source": "context_dump"}
             try:
@@ -532,19 +661,15 @@ async def dump_context_to_memory():
             except Exception as e:
                 logger.warning(f"JSON parse fallback: {e}")
                 parsed_meta = DiaryEntryMetadata(**base_meta)
-            
             if await check_plagiarism(clean_section, settings.diary.plagiarism_threshold):
                 continue
-            
             if query_preprocessor:
                 lemmatized = query_preprocessor.lemmatize_text(clean_section, remove_stopwords=False)
                 parsed_meta.type_specific["lemmatized"] = lemmatized
-            
             vector_store.add_texts(texts=[clean_section], metadatas=[parsed_meta.to_qdrant_payload()])
             if memory_manager:
                 memory_manager.save_diary_summary(text=clean_section, index=idx, total=total_sections, meta=parsed_meta)
             saved_count += 1
-        
         add_ai_thought(f"[DB] FINISH: {saved_count}/{total_sections} stored", (100,255,100))
         session_context.clear()
     except Exception as e:
@@ -580,10 +705,6 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
         return False
 
 
-# ============================================================================
-# Prompt Building
-# ============================================================================
-
 def build_system_prompt() -> str:
     if not character_base or not character_appearance:
         return "You are a helpful assistant."
@@ -604,55 +725,86 @@ def build_system_prompt() -> str:
 
 
 # ============================================================================
-# Message Processing
+# Message Processing (UNIFIED LOGIC v0.16.1 with FIX)
 # ============================================================================
 
 async def process_message(user_text: str) -> str:
     global session_context
-    
+
     if check_anti_repetition_semantic(user_text):
         return "I feel like we're going in circles. Let's talk about something new!"
-    
+
     if not session_context and memory_manager:
         add_ai_thought("[CTX] Context empty, loading recent history from DuckDB", (200,150,100))
         fresh = memory_manager.get_recent_history(limit=settings.context.max_history_messages)
         session_context.extend(fresh)
         add_ai_thought(f"[CTX] Loaded {len(fresh)} messages", (150,255,150))
-    
+
     async def attempt_generation():
         add_ai_thought(f"[CTX] Current context size: {len(session_context)} messages", (150,180,200))
         if len(session_context) > settings.context.warn_if_context_exceeds:
             add_ai_thought(f"[CTX] WARN: Large context ({len(session_context)}), may need dump soon", (255,200,100))
-        
+
         rag_context = await query_memory(user_text)
-        
         if not rag_context and memory_manager:
             add_ai_thought("[RAG] No vectors, trying DuckDB keyword search", (200,150,100))
             keyword_results = await keyword_search_in_history(user_text, limit=3)
             if keyword_results:
                 rag_context = f"--- Найдено в истории чата ---\n{keyword_results}"
                 add_ai_thought(f"[DB] Keyword search found results", (150,255,150))
+
+        system_prompt = build_system_prompt()
         
-        messages = [{"role": "system", "content": build_system_prompt()}]
+        # --- UNIFIED MESSAGE CONSTRUCTION ---
+        messages = [SystemMessage(content=system_prompt)]
         
         if rag_context:
-            messages.append({
-                "role": "assistant",
-                "content": f"Я вспоминаю:\n{rag_context}"
-            })
-        
+            messages.append(AIMessage(content=f"Я вспоминаю:\n{rag_context}"))
+
         max_hist = settings.context.max_history_messages
         recent = session_context[-max_hist:] if len(session_context) > max_hist else session_context
-        messages.extend(recent)
-        messages.append({"role": "user", "content": user_text})
         
-        response = await llm.ainvoke(messages)
-        return response.content
-    
+        for msg in recent:
+            if msg['role'] == 'user':
+                messages.append(HumanMessage(content=msg['content']))
+            elif msg['role'] == 'assistant':
+                messages.append(AIMessage(content=msg['content']))
+        
+        messages.append(HumanMessage(content=user_text))
+
+        content = ""
+        
+        if settings.chat_mode == "ollama":
+            response = await llm.ainvoke(messages)
+            content = response.content
+            reasoning = response.response_metadata.get("reasoning_content", "") or ""
+            if reasoning:
+                add_ai_thought(f"[REASONING]\n{reasoning}", (180,180,150))
+        else: 
+            # LLaMA Mode - streaming
+            full_content = ""
+            full_reasoning = ""
+            async for chunk in llm.astream(messages):
+                msg = chunk.message if hasattr(chunk, 'message') else chunk
+                if msg.content:
+                    full_content += msg.content
+                    update_ai_message_streaming(full_content)
+                if "reasoning_content" in msg.additional_kwargs:
+                    full_reasoning += msg.additional_kwargs["reasoning_content"]
+            if full_reasoning:
+                add_ai_thought(f"[REASONING]\n{full_reasoning}", (180,180,150))
+            content = full_content
+
+        # ========== FIX v0.16.1 ==========
+        # Return the generated content instead of None
+        return content
+        # ================================
+
     try:
         return await attempt_generation()
-    except BadRequestError as e:
-        if "context length" in str(e).lower() or "exceeds" in str(e).lower():
+    except (BadRequestError, APITimeoutError, TimeoutError) as e:
+        error_str = str(e).lower()
+        if "context length" in error_str or "exceeds" in error_str:
             add_ai_thought(f"[WARN] CONTEXT OVERFLOW: {len(session_context)} messages", (255,150,100))
             await dump_context_to_memory()
             if memory_manager:
@@ -660,8 +812,12 @@ async def process_message(user_text: str) -> str:
                 session_context.extend(fresh)
                 add_ai_thought(f"[CTX] Rehydrated: loaded {len(fresh)} messages", (150,255,150))
             return await attempt_generation()
+        elif "timeout" in error_str:
+            add_ai_thought("[WARN] LLM request timed out. Please try again with a shorter message.", (255,200,100))
+            return "I'm sorry, I took too long to think. Could you please repeat your question or make it shorter?"
         else:
-            raise
+            logger.error(f"LLM request failed: {e}")
+            return f"Sorry, I encountered an error: {e}"
     except Exception as e:
         logger.error(f"LLM request failed: {e}")
         return f"Sorry, I encountered an error: {e}"
@@ -669,37 +825,41 @@ async def process_message(user_text: str) -> str:
 
 async def save_to_memory(user_text: str, ai_response: str):
     global session_context
+    if not ai_response or len(ai_response.strip()) == 0:
+        add_ai_thought("[RAG] Skipped saving empty response", (255,150,150))
+        return
+
     if memory_manager:
         memory_manager.save_message("user", user_text)
         memory_manager.save_message("assistant", ai_response)
         add_ai_thought("[DB] Saved dialogue to chat_history", (150,200,150))
-    
+
     session_context.append({"role": "user", "content": user_text})
     session_context.append({"role": "assistant", "content": ai_response})
     add_ai_thought(f"[CTX] Context size: {len(session_context)} messages", (150,180,200))
-    
+
     if vector_store:
         content = f"User: {user_text}\nAI: {ai_response}"
         if len(content) > 2000:
             content = content[:2000].rsplit('.', 1)[0] + '.'
-        
+
         meta = await _extract_dialogue_metadata(user_text, ai_response)
         meta.update({"type": "dialogue", "timestamp": datetime.now().isoformat()})
-        
+
         if query_preprocessor:
             lemmatized = query_preprocessor.lemmatize_text(content, remove_stopwords=False)
             meta["lemmatized"] = lemmatized
             add_ai_thought(f"[RAG] Lemmatized copy stored (length {len(lemmatized)})", (150,200,150))
-        
+
         try:
             vector_store.add_texts(texts=[content], metadatas=[meta])
-            add_ai_thought(f"[RAG] Saved dialogue with metadata: entities={meta.get('entities', [])[:2]}...", (150,255,150))
+            add_ai_thought(f"[RAG] Saved dialogue with metadata", (150,255,150))
         except Exception as e:
             logger.warning(f"Failed to save to Qdrant: {e}")
 
 
 # ============================================================================
-# GUI и вспомогательные функции
+# GUI
 # ============================================================================
 
 async def report_qdrant_status():
@@ -874,23 +1034,23 @@ def main():
     Path("logs").mkdir(parents=True, exist_ok=True)
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Starting AI_EveryNyan v0.13.0 (debug={settings.debug})")
+
+    logger.info(f"Starting AI_EveryNyan v0.16.1 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     init_memory_manager()
     init_components()
     init_character()
-    
+
     async_loop = asyncio.new_event_loop()
     async_thread = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
     async_thread.start()
-    
+
     setup_gui()
     init_query_preprocessor()
     add_ai_thought("[SYS] STATUS: Online. Ready.", (100,255,100))
-    
+
     try:
         dpg.start_dearpygui()
     finally:

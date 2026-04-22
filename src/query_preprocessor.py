@@ -5,7 +5,7 @@ Provides lemmatization for indexing (RAG) and optional stopword removal.
 
 \src\query_preprocessor.py
 Version:     0.2.0
-Author:      Sorol L.'.L.'.
+Author:      Soror L.'.L.'.
 Updated:     2026-04-21
 
 Patch Notes v0.2.0:
@@ -38,7 +38,6 @@ class QueryPreprocessor:
     """
     
     # Minimal stopword list (only most common noise words)
-    # Used only when remove_stopwords=True
     RUSSIAN_STOPWORDS = {
         'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'а',
         'то', 'все', 'она', 'так', 'его', 'но', 'да', 'ты', 'к', 'у', 'же',
