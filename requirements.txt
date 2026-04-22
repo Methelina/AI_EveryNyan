@@ -36,3 +36,4 @@ markdownify>=0.14.0
 # === MCP Agent Integration ===
 langchain-mcp-adapters>=0.1.0
 langgraph>=0.4.0
+spacy>=3.7.0
