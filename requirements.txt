@@ -28,3 +28,11 @@ dearpygui>=1.11.0
 structlog>=24.0.0
 PyYAML>=6.0.1
 tqdm>=4.66.0
+
+# === MCP Server (SearXNG) ===
+fastmcp>=2.0.0
+markdownify>=0.14.0
+
+# === MCP Agent Integration ===
+langchain-mcp-adapters>=0.1.0
+langgraph>=0.4.0
