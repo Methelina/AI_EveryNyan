@@ -4,22 +4,13 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.16.1
+Version:     0.16.2 (MCP agent logging with colors)
 Author:      Soror L.'.L.'.
-Updated:     2026-04-22
+Updated:     2026-04-23
 
-Patch Notes v0.16.1:
-  [FIX] Critical bug in LLaMA mode: process_message returned None
-        because inner function attempt_generation() missed 'return content'.
-  [FIX] Now AI response is properly saved to memory and displayed.
-
-Patch Notes v0.16.0:
-  [+] REFACTOR: Replaced custom LlamaAdapter with LangChain-native LlamaChatModel.
-  [+] FEATURE: Unified prompt handling using LangChain Messages (System/Human/AI).
-  [+] FIX: Removed manual string concatenation for prompts (less bugs, better formatting).
-  [+] IMPROVE: Integrated streaming support directly into the LangChain pipeline.
-  [+] FIX: Handled empty API keys gracefully (defaults to "not-needed" for local servers).
-  [+] CLEANUP: Removed obsolete LlamaAdapter class and manual JSON parsing logic.
+Patch Notes v0.16.2:
+  [+] MCP agent logging: tool calls and results are displayed in SYSTEM LOG with colors.
+  [+] Added error handling for agent execution.
 """
 
 import os
@@ -59,6 +50,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     AIMessageChunk,
+    ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
@@ -533,29 +525,43 @@ def _to_lc_messages(raw_msgs: list[dict]) -> list:
 async def init_mcp_agent():
     global mcp_client, react_agent
     try:
-        # Ensure project root is importable (for tools.mcp package)
         project_root = str(Path(__file__).resolve().parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
 
         import warnings
-
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             from langgraph.prebuilt import create_react_agent
         from tools.mcp import return_mcp_client
+        from langchain_core.tools import StructuredTool
 
         searxng_url = getattr(settings, "searxng_url", "http://localhost:2597")
         mcp_client = return_mcp_client(SEARXNG_URL=searxng_url)
 
-        tools = await mcp_client.get_tools()
-        if tools:
+        raw_tools = await mcp_client.get_tools()
+        if raw_tools:
+            # Обёртка: извлекаем текст из списка, который возвращает MCP
+            def unwrap_tool(original_tool):
+                async def _wrapper(**kwargs):
+                    result = await original_tool.ainvoke(kwargs)
+                    # Типичный результат от MCP: [{'type': 'text', 'text': '...'}]
+                    if isinstance(result, list) and result and isinstance(result[0], dict):
+                        text_parts = [item.get('text', '') for item in result if item.get('type') == 'text']
+                        if text_parts:
+                            return "\n".join(text_parts)
+                    return str(result)
+                return StructuredTool.from_function(
+                    coroutine=_wrapper,
+                    name=original_tool.name,
+                    description=original_tool.description,
+                    args_schema=original_tool.args_schema,
+                )
+            tools = [unwrap_tool(t) for t in raw_tools]
+            
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=DeprecationWarning)
-                react_agent = create_react_agent(
-                    model=llm,
-                    tools=tools,
-                )
+                react_agent = create_react_agent(model=llm, tools=tools)
             tool_names = [t.name for t in tools]
             logger.info(f"[MCP] React agent initialized with tools: {tool_names}")
             add_ai_thought(
@@ -856,7 +862,7 @@ def build_system_prompt() -> str:
 
 
 # ============================================================================
-# Message Processing (UNIFIED LOGIC v0.16.1 with FIX)
+# Message Processing (UNIFIED LOGIC v0.16.1 with MCP LOGGING)
 # ============================================================================
 
 
@@ -912,7 +918,50 @@ async def process_message(user_text: str) -> str:
 
         if react_agent:
             add_ai_thought("[MCP] Using react agent with tools", (100, 200, 255))
-            result = await react_agent.ainvoke({"messages": messages})
+            try:
+                result = await react_agent.ainvoke({"messages": messages})
+            except Exception as agent_err:
+                logger.error(f"MCP agent execution failed: {agent_err}", exc_info=True)
+                add_ai_thought(f"[MCP] Agent error: {agent_err}. Falling back to direct LLM.", (255, 100, 100))
+                # fallback to direct LLM (ollama or llama)
+                if settings.chat_mode == "ollama":
+                    response = await llm.ainvoke(messages)
+                    content = response.content
+                else:
+                    full_content = ""
+                    async for chunk in llm.astream(messages):
+                        msg_chunk = chunk.message if hasattr(chunk, 'message') else chunk
+                        if msg_chunk.content:
+                            full_content += msg_chunk.content
+                            update_ai_message_streaming(full_content)
+                    content = full_content
+                finalize_ai_message_streaming()
+                return content
+
+            # ========== MCP TOOL LOGGING ==========
+            for msg in result["messages"]:
+                # Tool call request (AIMessage with tool_calls)
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_name = tc.get('name', 'unknown')
+                        tool_args = tc.get('args', {})
+                        # Жёлтый цвет для вызова инструмента
+                        add_ai_thought(f"[TOOL] Call: {tool_name} args={tool_args}", (255, 220, 100))
+                        logger.info(f"MCP TOOL CALL: {tool_name} {tool_args}")
+                
+                # Tool result (ToolMessage)
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', 'unknown')
+                    result_preview = msg.content[:200] + ('...' if len(msg.content) > 200 else '')
+                    # Зелёный цвет для успешного результата
+                    add_ai_thought(f"[TOOL] Result from {tool_name}: {result_preview}", (100, 255, 100))
+                    logger.info(f"MCP TOOL RESULT ({tool_name}): {msg.content}")
+                    
+                    # Если в результате есть явная ошибка - покажем красным
+                    if "error" in msg.content.lower() or "exception" in msg.content.lower():
+                        add_ai_thought(f"[TOOL] Error in {tool_name}: {msg.content[:300]}", (255, 100, 100))
+            # ======================================
+            
             content = result["messages"][-1].content
             final_msg = result["messages"][-1]
             reasoning = ""
@@ -947,10 +996,7 @@ async def process_message(user_text: str) -> str:
                 add_ai_thought(f"[REASONING]\n{full_reasoning}", (180,180,150))
             content = full_content
 
-        # ========== FIX v0.16.1 ==========
-        # Return the generated content instead of None
         return content
-        # ================================
 
     try:
         return await attempt_generation()
@@ -1192,7 +1238,7 @@ def main():
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting AI_EveryNyan v0.16.1 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.16.2 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
