@@ -4,24 +4,18 @@ Exposes two tools: web_search for meta-search, fetch_url for page content retrie
 
 \\tools\\mcp\\tool_searxng.py
 
-Version:     0.4.0
+Version:     0.4.2
 Author:      pytraveler
 Updated:     2026-04-23
 
-Patch Notes v0.4.0 (by Soror L.'.L.'):
-  [+] Integrated support for Playwright and Nodriver scrapers.
-  [+] Added FETCH_MODE variable to select content engine (legacy/playwright/nodriver).
-  [+] Playwright and Nodriver use a shared isolated browser path (.cache/ms-playwright).
-  [*] fetch_url split into three methods: fetch_legacy (bs4+httpx), fetch_playwright, fetch_nodriver.
-  [*] Both new methods use shared HTML cleaning and Markdown conversion logic.
+Patch Notes v0.4.2 (by Soror L.'.L.'):
+  [OPT] ISOLATED_BROWSER_PATH now respects PLAYWRIGHT_BROWSERS_PATH from env (set by .bat).
+  [FIX] Falls back to relative path calculation if env var is missing.
+  [FIX] Updated get_chrome_executable_path to detect 'chromium_headless_shell' directories.
 
-Patch Notes v0.3.0 (by Soror L.'.L.'):
-  [CHANGE] fetch_url fully rewritten to "bs4 + markdownify" method (no trafilatura).
-  [+] fetch_url: preliminary HTML cleaning via BeautifulSoup (remove script/style/nav/footer/...).
-  [+] fetch_url: converting cleaned HTML to Markdown via markdownify.
-  [+] fetch_url: added brief stderr output (URL and extracted text size).
-  [REMOVED] trafilatura is no longer used (proven less stable on complex sites).
-  [+] Configuration variables moved to top of file (limits, timeouts, paths).
+Patch Notes v0.4.1 (by Soror L.'.L.'):
+  [FIX] Corrected ISOLATED_BROWSER_PATH to point to 'playwright_browsers'.
+  [FIX] Updated get_chrome_executable_path to detect 'chromium_headless_shell' directories.
 """
 
 import os
@@ -36,19 +30,29 @@ from fastmcp import FastMCP
 # ============================================================================
 
 # SCRAPER MODE SELECTION: 'legacy', 'playwright', 'nodriver'
-# 'legacy' - fast httpx + bs4 (no JS).
-# 'playwright' - full browser (accurate, but heavier).
-# 'nodriver' - CDP browser (fast, lightweight, renders JS).
 FETCH_MODE = os.environ.get("FETCH_MODE", "playwright")
 
-# Browser Paths (Isolated Installation)
-# Assuming script is in <repo>/tools/mcp/
-# Repo root is 3 levels up.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ISOLATED_BROWSER_PATH = os.path.join(REPO_ROOT, ".cache", "ms-playwright")
+# ============================================================================
+# BROWSER PATH RESOLUTION (Priority: Env Var -> Relative Calculation)
+# ============================================================================
 
-# Set environment variable for Playwright to see local browser
+# 1. Try to get path from Environment Variable (set by run_ai_everynyan.bat)
+ISOLATED_BROWSER_PATH = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+
+# 2. Fallback: Calculate path relative to this script if Env Var is missing
+if not ISOLATED_BROWSER_PATH:
+    # Assuming script is in <repo>/tools/mcp/
+    # Repo root is 3 levels up.
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ISOLATED_BROWSER_PATH = os.path.join(REPO_ROOT, "playwright_browsers")
+    print(f"[MCP] No PLAYWRIGHT_BROWSERS_PATH env var found, using calculated path: {ISOLATED_BROWSER_PATH}", file=sys.stderr)
+
+# Ensure Playwright library sees this path
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = ISOLATED_BROWSER_PATH
+
+# ============================================================================
+# GENERAL SETTINGS
+# ============================================================================
 
 # Limits for fetch_url (extracted text size)
 DEFAULT_MAX_FETCH_LENGTH = 500000          # Default max characters
@@ -124,25 +128,36 @@ def log_debug(msg: str):
 
 def get_chrome_executable_path() -> str | None:
     """
-    Attempts to find Chrome executable in the isolated Playwright installation folder.
-    Required for nodriver as it might not pick up Playwright env vars automatically.
+    Attempts to find Chrome or Chrome Headless Shell executable in the isolated installation.
+    Searches for both full chromium and chromium_headless_shell folders.
     """
-    # Playwright folder structure: .cache/ms-playwright/chromium-<version>/chrome-<os>/chrome.exe
-    # Search for last chromium version
+    # Search for full chromium first
     base_path = os.path.join(ISOLATED_BROWSER_PATH, "chromium-*")
     chromium_dirs = glob.glob(base_path)
+    
+    # Fallback: Look for headless shell if full chromium not found
     if not chromium_dirs:
-        log_debug(f"Chromium not found in {base_path}")
+        log_debug("Full chromium not found, searching for chromium_headless_shell...")
+        base_path = os.path.join(ISOLATED_BROWSER_PATH, "chromium_headless_shell-*")
+        chromium_dirs = glob.glob(base_path)
+
+    if not chromium_dirs:
+        log_debug(f"No browser found in {ISOLATED_BROWSER_PATH}")
         return None
     
     # Take last alphabetical (usually latest version)
     chromium_dir = sorted(chromium_dirs)[-1]
     
-    # Search for binary folder (chrome-win or mac, linux)
+    # Prioritize full chrome.exe over chrome-headless-shell.exe
     possible_paths = [
+        # Full Chromium
         os.path.join(chromium_dir, "chrome-win", "chrome.exe"),
         os.path.join(chromium_dir, "chrome-linux", "chrome"),
         os.path.join(chromium_dir, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+        # Headless Shell (Newer Playwright versions)
+        os.path.join(chromium_dir, "chrome-headless-shell-win64", "chrome-headless-shell.exe"),
+        os.path.join(chromium_dir, "chrome-headless-shell-linux", "chrome-headless-shell"),
+        os.path.join(chromium_dir, "chrome-headless-shell-mac", "chrome-headless-shell"),
     ]
     
     for path in possible_paths:
@@ -153,6 +168,10 @@ def get_chrome_executable_path() -> str | None:
     found = glob.glob(os.path.join(chromium_dir, "**", "chrome.exe"), recursive=True)
     if found:
         return found[0]
+        
+    found_shell = glob.glob(os.path.join(chromium_dir, "**", "chrome-headless-shell.exe"), recursive=True)
+    if found_shell:
+        return found_shell[0]
     
     return None
 
@@ -216,9 +235,6 @@ async def fetch_playwright(url: str, max_length: int) -> str:
             # Set load timeout
             await page.goto(url, wait_until="domcontentloaded", timeout=HTTP_TIMEOUT * 1000)
             
-            # Small delay for simple JS scripts
-            # await page.wait_for_timeout(1000) # Optional
-            
             html = await page.content()
             await browser.close()
             return html
@@ -246,7 +262,6 @@ async def fetch_nodriver(url: str, max_length: int) -> str:
         tab = browser.main_tab
         await tab.get(url)
         
-        # Wait for load completion (nodriver waits automatically)
         html = await tab.content
         await browser.stop()
         return html
