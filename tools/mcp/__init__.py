@@ -1,3 +1,4 @@
+"""\tools\mcp\__init__.py"""
 import os
 import sys
 import logging
