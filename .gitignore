@@ -16,6 +16,7 @@ ENV/
 
 # === Runtime Data (Generated, Heavy, Personal) ===
 data/
+playwright_browsers/
 logs/
 hf_cache/
 temp/

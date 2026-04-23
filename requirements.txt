@@ -37,6 +37,10 @@ markdownify>=0.14.0
 beautifulsoup4>=4.12.0      # required for HTML cleaning in fetch_url
 lxml>=5.0.0                 # recommended for faster parsing with BeautifulSoup
 
+# === Browser automation (for fetch_url with JS rendering) ===
+playwright>=1.40.0          # required for render_js mode (method 4)
+nodriver>=0.1.0             # optional, for method 5 (alternative browser automation)
+
 # === MCP Agent Integration ===
 langchain-mcp-adapters>=0.1.0
 langgraph>=0.4.0
