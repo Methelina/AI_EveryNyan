@@ -2,19 +2,49 @@
 .SYNOPSIS
     Установщик AI_EveryNyan (плоская структура).
     Создает Conda-окружение, устанавливает зависимости, скачивает bge-m3 в Ollama,
-    устанавливает spaCy и языковые модели, генерирует полный конфиг settings.yaml.
+    устанавливает spaCy и языковые модели, генерирует полный конфиг settings.yaml,
+    устанавливает Playwright и Chromium в папку проекта (изолированно).
     Идемпотентен: безопасен для повторного запуска.
 
     \install_ai_everynyan.ps1
-    Version: 0.6.0
+    Version: 0.7.1
     Author: Soror L.'.L.'.
     Updated: 2026-04-23
-
-    Patchnote v0.6.0:
-      [+] Добавлены проверки импортов для всех новых зависимостей из requirements.txt
-          (aiohttp, httpx, duckdb, langchain*, openai, fastmcp, markdownify, langgraph и др.)
-      [*] Версия инсталлятора повышена до 0.6.0
 #>
+
+# Patchnote v0.7.1:
+#   - Удалено создание скриптов запуска (run_ai_everynyan.bat и .example) – пользователь сам настраивает.
+#   + Добавлена проверка наличия Chromium в playwright_browsers после установки.
+#   * Улучшена справка по переменной PLAYWRIGHT_BROWSERS_PATH для существующего bat-файла.
+
+# Patchnote v0.7.0:
+#   + Добавлена изолированная установка Playwright Chromium в папку проекта
+#       (через PLAYWRIGHT_BROWSERS_PATH).
+#   * Обновлен список проверки импортов: добавлены playwright и nodriver.
+
+# Patchnote v0.6.0:
+#   + Добавлены проверки импортов для всех новых зависимостей из requirements.txt
+#       (aiohttp, httpx, duckdb, langchain*, openai, fastmcp, markdownify, langgraph и др.)
+
+
+# ==========================================
+Write-Host " ===========================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "  ██▓        ██▓    ██▓        ██▓" -ForegroundColor Yellow
+Write-Host " ▓██▒              ▓██▒" -ForegroundColor Yellow
+Write-Host " ▒██░              ▒██░" -ForegroundColor Yellow
+Write-Host " ▒██░              ▒██░" -ForegroundColor Yellow
+Write-Host " ░██████▒ ██▓  ██▓ ░██████▒ ██▓  ██▓" -ForegroundColor Yellow
+Write-Host " ░ ▒░▓  ░ ▒▓▒  ▒▓▒ ░ ▒░▓  ░ ▒▓▒  ▒▓▒" -ForegroundColor Yellow
+Write-Host " ░ ░ ▒  ░ ░▒   ░▒  ░ ░ ▒  ░ ░▒   ░▒" -ForegroundColor Yellow
+Write-Host "   ░ ░    ░    ░     ░ ░    ░    ░" -ForegroundColor Yellow
+Write-Host "     ░  ░  ░    ░      ░  ░  ░    ░" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  ===========================================" -ForegroundColor Green
+Write-Host "    EveryNyan AI by L.'.L.'." -ForegroundColor Yellow
+Write-Host "    AI_EveryNyan Installer v0.7.1" -ForegroundColor Green
+Write-Host ""
+# ==========================================
 
 # === Настройка кодировки ===
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -32,6 +62,7 @@ $LogsPath = Join-Path $ProjectRoot "logs"
 $CachePath = Join-Path $ProjectRoot "hf_cache"
 $TempPath = Join-Path $ProjectRoot "temp"
 $ReqFile = Join-Path $ProjectRoot "requirements.txt"
+$PlaywrightBrowsersPath = Join-Path $ProjectRoot "playwright_browsers"
 
 # === Вспомогательные функции ===
 
@@ -196,11 +227,11 @@ debug: false
 # === Основной процесс ===
 
 Write-Status "╔════════════════════════════════════════╗" "INFO"
-Write-Status "║  AI_EveryNyan Installer v0.6.0         ║" "INFO"
+Write-Status "║  AI_EveryNyan Installer v0.7.1         ║" "INFO"
 Write-Status "╚════════════════════════════════════════╝" "INFO"
 
 # 1. Проверка зависимостей
-Write-Status "[1/7] Проверка системных зависимостей..." "INFO"
+Write-Status "[1/8] Проверка системных зависимостей..." "INFO"
 $Missing = @()
 if (!(Test-Command "git")) { $Missing += "Git" }
 if (!(Test-Command "conda")) { $Missing += "Conda (Miniforge/Anaconda)" }
@@ -215,8 +246,8 @@ if ($Missing.Count -gt 0) {
 Write-Status "  [+] Git, Conda, Docker, Ollama найдены" "SUCCESS"
 
 # 2. Создание структуры папок
-Write-Status "`n[2/7] Создание структуры проекта..." "INFO"
-$Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage")
+Write-Status "`n[2/8] Создание структуры проекта..." "INFO"
+$Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage", $PlaywrightBrowsersPath)
 foreach ($dir in $Dirs) {
     if (!(Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -225,7 +256,7 @@ foreach ($dir in $Dirs) {
 Write-Status "  [+] Директории готовы" "SUCCESS"
 
 # 3. Генерация конфигурации (новый полный шаблон)
-Write-Status "`n[3/7] Подготовка конфигурации..." "INFO"
+Write-Status "`n[3/8] Подготовка конфигурации..." "INFO"
 $SettingsExample = Join-Path $ConfigPath "settings.yaml.example"
 $SettingsActual = Join-Path $ConfigPath "settings.yaml"
 
@@ -240,7 +271,7 @@ if (!(Test-Path $SettingsActual)) {
 }
 
 # 4. Установка Ollama-модели bge-m3:latest
-Write-Status "`n[4/7] Проверка embedding-модели bge-m3:latest..." "INFO"
+Write-Status "`n[4/8] Проверка embedding-модели bge-m3:latest..." "INFO"
 
 $modelInstalled = $false
 try {
@@ -267,7 +298,7 @@ if ($modelInstalled) {
 }
 
 # 5. Conda-окружение + pip install
-Write-Status "`n[5/7] Настройка Python-окружения..." "INFO"
+Write-Status "`n[5/8] Настройка Python-окружения..." "INFO"
 
 if (!(Test-Path $EnvPath)) {
     Write-Status "  Создание Conda env: $EnvPath" "INFO"
@@ -281,7 +312,7 @@ if (!(Test-Path $EnvPath)) {
     }
 }
 
-# Установка зависимостей
+# Установка зависимостей из requirements.txt
 if (Test-Path $ReqFile) {
     Write-Status "  Установка requirements..." "INFO"
     $pipOk = Invoke-WithRetry {
@@ -294,8 +325,34 @@ if (Test-Path $ReqFile) {
     Write-Status "  [!] requirements.txt не найден в корне" "WARN"
 }
 
+# 5b. Установка Playwright и изолированного Chromium
+Write-Status "`n[5b/8] Установка Playwright и Chromium в проект..." "INFO"
+
+# Убедимся, что playwright установлен
+& $PythonExe -m pip install playwright>=1.40.0
+if ($LASTEXITCODE -ne 0) {
+    Write-Status "  [!] Не удалось установить playwright" "WARN"
+} else {
+    # Сохраняем старую переменную окружения, если была
+    $oldPlaywrightPath = $env:PLAYWRIGHT_BROWSERS_PATH
+    try {
+        $env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightBrowsersPath
+        Write-Status "  Установка Chromium в $PlaywrightBrowsersPath ..." "INFO"
+        & $PythonExe -m playwright install chromium
+        if ($LASTEXITCODE -eq 0) {
+            Write-Status "  [+] Chromium успешно установлен в папку проекта (изолированно)" "SUCCESS"
+        } else {
+            Write-Status "  [!] Ошибка при установке Chromium (код $LASTEXITCODE)" "WARN"
+        }
+    } finally {
+        # Восстанавливаем прежнее значение
+        if ($oldPlaywrightPath) { $env:PLAYWRIGHT_BROWSERS_PATH = $oldPlaywrightPath }
+        else { Remove-Item Env:PLAYWRIGHT_BROWSERS_PATH -ErrorAction SilentlyContinue }
+    }
+}
+
 # 6. Установка spaCy и языковых моделей
-Write-Status "`n[6/7] Установка spaCy и языковых моделей..." "INFO"
+Write-Status "`n[6/8] Установка spaCy и языковых моделей..." "INFO"
 
 # Проверка, установлен ли spaCy
 $spacyInstalled = & $PythonExe -c "import spacy" 2>$null
@@ -354,8 +411,8 @@ if (Test-SpacyModel -ModelName $enModel) {
     }
 }
 
-# 7. Проверка критических импортов (включая все новые зависимости)
-Write-Status "`n[7/7] Проверка критических импортов..." "INFO"
+# 7. Проверка критических импортов (включая playwright и nodriver)
+Write-Status "`n[7/8] Проверка критических импортов..." "INFO"
 
 $Modules = @(
     # Основные библиотеки
@@ -365,24 +422,30 @@ $Modules = @(
     "pydantic",
     "asyncio",
     "spacy",
-    # Новые зависимости из requirements.txt
+    # Сетевые и базы данных
     "aiohttp",
     "httpx",
     "duckdb",
+    # LangChain и интеграции
     "langchain",
     "langchain_community",
     "langchain_qdrant",
     "langchain_openai",
     "openai",
+    # Конфиги и утилиты
     "pydantic_settings",
-    "dotenv",           # python-dotenv
+    "dotenv",
     "structlog",
-    "yaml",             # PyYAML
+    "yaml",
     "tqdm",
+    # MCP инструменты
     "fastmcp",
     "markdownify",
     "langchain_mcp_adapters",
-    "langgraph"
+    "langgraph",
+    # Browser automation
+    "playwright.async_api",
+    "nodriver"      # опционально, но проверяем
 )
 
 $AllOK = $true
@@ -391,24 +454,45 @@ foreach ($mod in $Modules) {
     if ($LASTEXITCODE -eq 0) {
         Write-Status "    [+] $mod" "SUCCESS"
     } else {
-        Write-Status "    [!] $mod НЕ НАЙДЕН" "ERROR"
-        $AllOK = $false
+        # nodriver может отсутствовать – не считаем ошибкой
+        if ($mod -eq "nodriver") {
+            Write-Status "    [?] $mod не установлен (опционально)" "WARN"
+        } else {
+            Write-Status "    [!] $mod НЕ НАЙДЕН" "ERROR"
+            $AllOK = $false
+        }
     }
 }
 
 # Дополнительная проверка моделей spaCy
-if ($AllOK) {
-    $ruCheck = & $PythonExe -c "import spacy; spacy.load('ru_core_news_sm')" 2>$null
-    if ($LASTEXITCODE -eq 0) { Write-Status "    [+] ru_core_news_sm (spacy)" "SUCCESS" }
-    else { Write-Status "    [!] ru_core_news_sm не найдена" "WARN"; $AllOK = $false }
+$ruCheck = & $PythonExe -c "import spacy; spacy.load('ru_core_news_sm')" 2>$null
+if ($LASTEXITCODE -eq 0) { Write-Status "    [+] ru_core_news_sm (spacy)" "SUCCESS" }
+else { Write-Status "    [!] ru_core_news_sm не найдена" "WARN"; $AllOK = $false }
 
-    $enCheck = & $PythonExe -c "import spacy; spacy.load('en_core_web_sm')" 2>$null
-    if ($LASTEXITCODE -eq 0) { Write-Status "    [+] en_core_web_sm (spacy)" "SUCCESS" }
-    else { Write-Status "    [!] en_core_web_sm не найдена" "WARN"; $AllOK = $false }
-}
+$enCheck = & $PythonExe -c "import spacy; spacy.load('en_core_web_sm')" 2>$null
+if ($LASTEXITCODE -eq 0) { Write-Status "    [+] en_core_web_sm (spacy)" "SUCCESS" }
+else { Write-Status "    [!] en_core_web_sm не найдена" "WARN"; $AllOK = $false }
 
 if ($AllOK) { Write-Status "  [+] Все импорты и модели успешны" "SUCCESS" }
 else { Write-Status "  [!] Ошибка импорта. Проверьте логи или переустановите окружение." "ERROR" }
+
+# 8. Проверка Chromium и рекомендации по запуску
+Write-Status "`n[8/8] Проверка изолированного Chromium..." "INFO"
+if (Test-Path $PlaywrightBrowsersPath) {
+    $chromiumDirs = Get-ChildItem -Path $PlaywrightBrowsersPath -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue
+    if ($chromiumDirs) {
+        Write-Status "  [+] Chromium установлен в: $PlaywrightBrowsersPath" "SUCCESS"
+    } else {
+        Write-Status "  [!] Папка playwright_browsers существует, но Chromium не найден. Возможно, установка не завершилась." "WARN"
+    }
+} else {
+    Write-Status "  [!] Папка playwright_browsers не найдена. Chromium не установлен." "WARN"
+}
+
+Write-Status "`n=== Важно для запуска приложения ===" "INFO"
+Write-Status "Убедитесь, что в вашем run_ai_everynyan.bat (или любом другом скрипте запуска) установлена переменная окружения:" "INFO"
+Write-Status "  set PLAYWRIGHT_BROWSERS_PATH=%~dp0playwright_browsers" "WARN"
+Write-Status "Это обеспечит использование изолированного Chromium из проекта." "INFO"
 
 # === Финал ===
 Write-Status "" "INFO"
@@ -417,14 +501,16 @@ Write-Status "║   Установка завершена!                 ║" 
 Write-Status "╚════════════════════════════════════════╝" "SUCCESS"
 Write-Status "" "INFO"
 Write-Status "Следующие шаги:" "INFO"
-Write-Status "  1. Убедитесь, что внешние запускаторы (run_ai_everynyan.bat, run_qdrant.bat) присутствуют в корне проекта" "INFO"
+Write-Status "  1. Убедитесь, что внешние запускаторы (run_qdrant.bat, run_searxng.bat) присутствуют в корне проекта" "INFO"
 Write-Status "  2. Запустите Qdrant (run_qdrant.bat)" "INFO"
 Write-Status "  3. Запустите Ollama (ollama serve)" "INFO"
 Write-Status "  4. Запустите SearXNG (run_searxng.bat)" "INFO"
-Write-Status "  5. Запустите приложение через run_ai_everynyan.bat" "INFO"
+Write-Status "  5. Добавьте переменную PLAYWRIGHT_BROWSERS_PATH в ваш run_ai_everynyan.bat (см. рекомендацию выше)" "INFO"
+Write-Status "  6. Запустите приложение через run_ai_everynyan.bat" "INFO"
 Write-Status "" "INFO"
 Write-Status "Конфиг: $ConfigPath\settings.yaml" "INFO"
 Write-Status "Логи:   $LogsPath\install.log" "INFO"
+Write-Status "Playwright браузер: $PlaywrightBrowsersPath (изолирован)" "INFO"
 
 Read-Host "`nНажмите Enter для завершения"
 exit 0

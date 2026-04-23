@@ -1,6 +1,36 @@
+rem ---------------------------------------------------------
+rem /run_ai_everynyan.bat
+rem Version: 1.1.0
+rem Author:  Soror L.'.L.'.
+rem Updated: 2026-04-23
+rem
+rem Patchnote v1.1.0:
+rem   [+] Added PLAYWRIGHT_BROWSERS_PATH to use isolated Chromium from project.
+rem
+rem Patchnote v1.0.0:
+rem   [+] Initial launch script.
+rem ---------------------------------------------------------
+
 @echo off
 chcp 65001 >nul
-title AI_EveryNyan Chat
+title AI_EveryNyan Chat Launcher by L.'.L.'.
+:: ===========================================
+echo.
+echo   ██▓        ██▓    ██▓        ██▓
+echo  ▓██▒              ▓██▒
+echo  ▒██░              ▒██░
+echo  ▒██░              ▒██░
+echo  ░██████▒ ██▓  ██▓ ░██████▒ ██▓  ██▓
+echo  ░ ▒░▓  ░ ▒▓▒  ▒▓▒ ░ ▒░▓  ░ ▒▓▒  ▒▓▒
+echo  ░ ░ ▒  ░ ░▒   ░▒  ░ ░ ▒  ░ ░▒   ░▒
+echo    ░ ░    ░    ░     ░ ░    ░    ░
+echo      ░  ░  ░    ░      ░  ░  ░    ░
+echo.
+echo  ===========================================
+echo    AI_EveryNyan Chat Launcher by L.'.L.'. 
+echo    Launcher Version: 1.1.0
+echo  ===========================================
+echo.
 
 :: === Paths ===
 set "ROOT=%~dp0"
@@ -14,6 +44,9 @@ set "QDRANT_URL=http://localhost:6333"
 set "PYTHONUNBUFFERED=1"
 set "QT_AUTO_SCREEN_SCALE_FACTOR=0"
 set "QT_SCALE_FACTOR=1"
+
+:: Playwright browsers path (isolated Chromium)
+set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%playwright_browsers"
 
 if not exist "%ENV%\python.exe" (
     echo [ERROR] Environment not found. Run install_ai_everynyan.ps1 first.
