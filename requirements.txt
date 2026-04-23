@@ -32,10 +32,11 @@ spacy>=3.7.0
 
 # === MCP Server (SearXNG) ===
 fastmcp>=2.0.0
-trafilatura>=2.0.0
+trafilatura>=2.0.0          # optional (not used in current fetch_url, kept for compatibility)
 markdownify>=0.14.0
+beautifulsoup4>=4.12.0      # required for HTML cleaning in fetch_url
+lxml>=5.0.0                 # recommended for faster parsing with BeautifulSoup
 
 # === MCP Agent Integration ===
 langchain-mcp-adapters>=0.1.0
 langgraph>=0.4.0
-
