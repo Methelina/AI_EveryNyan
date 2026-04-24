@@ -4,9 +4,17 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.16.2 (MCP agent logging with colors)
+Version:     0.16.3 (MCP fix for llama mode)
 Author:      Soror L.'.L.'.
-Updated:     2026-04-23
+Updated:     2026-04-24
+
+Patch Notes v0.16.3 [pytraveler]:
+  [FIX] MCP agent now initializes correctly in llama mode (chat_mode="llama").
+        LlamaChatModel lacks bind_tools() (NotImplementedError in BaseChatModel),
+        so a ChatOpenAI wrapper is created for the react agent in llama mode,
+        leveraging the OpenAI-compatible API of llama-server.
+  [+] Improved MCP init error logging: full exception type name and traceback
+      instead of empty "Failed to initialize MCP agent: ".
 
 Patch Notes v0.16.2:
   [+] MCP agent logging: tool calls and results are displayed in SYSTEM LOG with colors.
@@ -58,6 +66,7 @@ from langchain_core.callbacks.manager import AsyncCallbackManagerForLLMRun
 # Local imports
 from memory_manager import MemoryManager, DiaryEntryMetadata
 from query_preprocessor import QueryPreprocessor
+import logging_exceptions
 
 # ============================================================================
 # LlamaChatModel (Native LangChain Adapter - FIXED v2)
@@ -558,10 +567,30 @@ async def init_mcp_agent():
                     args_schema=original_tool.args_schema,
                 )
             tools = [unwrap_tool(t) for t in raw_tools]
-            
+
+            # LlamaChatModel не реализует bind_tools() (NotImplementedError в BaseChatModel).
+            # Для react-agent создаём ChatOpenAI, т.к. llama-server предоставляет
+            # OpenAI-совместимый API с поддержкой function/tool calling.
+            agent_model = llm
+            if settings.chat_mode != "ollama":
+                chat_cfg = settings.get_chat_config()
+                api_key = chat_cfg.api_key if chat_cfg.api_key else "not-needed"
+                agent_model = ChatOpenAI(
+                    model=chat_cfg.chat_model,
+                    openai_api_key=api_key,
+                    openai_api_base=chat_cfg.base_url,
+                    temperature=chat_cfg.temperature,
+                    timeout=chat_cfg.timeout,
+                    max_tokens=chat_cfg.max_tokens,
+                    streaming=False,
+                )
+                logger.info(
+                    "[MCP] Using ChatOpenAI wrapper for react agent (llama mode)"
+                )
+
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=DeprecationWarning)
-                react_agent = create_react_agent(model=llm, tools=tools)
+                react_agent = create_react_agent(model=agent_model, tools=tools)
             tool_names = [t.name for t in tools]
             logger.info(f"[MCP] React agent initialized with tools: {tool_names}")
             add_ai_thought(
@@ -572,8 +601,13 @@ async def init_mcp_agent():
             logger.info("[MCP] No MCP tools discovered, running without tool support")
             add_ai_thought("[MCP] No tools found (standalone mode)", (200, 200, 150))
     except Exception as e:
-        logger.warning(f"[MCP] Failed to initialize MCP agent: {e}")
-        add_ai_thought(f"[MCP] Init skipped: {e}", (255, 200, 100))
+        import traceback
+
+        tb_str = traceback.format_exception(type(e), e, e.__traceback__)
+        logger.warning(
+            f"[MCP] Failed to initialize MCP agent: {type(e).__name__}: {e}\n{''.join(tb_str)}"
+        )
+        add_ai_thought(f"[MCP] Init skipped: {type(e).__name__}: {e}", (255, 200, 100))
         mcp_client = None
         react_agent = None
 
@@ -1237,6 +1271,9 @@ def main():
     Path("logs").mkdir(parents=True, exist_ok=True)
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
+
+    if settings.debug:
+        logging_exceptions.install_excepthook()
 
     logger.info(f"Starting AI_EveryNyan v0.16.2 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
