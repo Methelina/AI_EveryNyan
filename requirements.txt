@@ -44,3 +44,11 @@ nodriver>=0.1.0             # optional, for method 5 (alternative browser automa
 # === MCP Agent Integration ===
 langchain-mcp-adapters>=0.1.0
 langgraph>=0.4.0
+
+# === Vision / Image Processing (for describe_image tool) ===
+Pillow>=10.0.0              # image validation, sanitization, resizing, PNG conversion
+# opencv-python>=4.8.0     # not yet required; would be needed for video frame extraction
+
+# Patch Notes v0.14.0 (Soror L.'.L.'):
+#   [+] Added Pillow for multimodal vision tool (describe_image).
+#   [*] No other changes – existing libraries cover all features.
