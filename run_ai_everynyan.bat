@@ -1,15 +1,15 @@
-rem ---------------------------------------------------------
-rem /run_ai_everynyan.bat
-rem Version: 1.1.0
-rem Author:  Soror L.'.L.'.
-rem Updated: 2026-04-23
-rem
-rem Patchnote v1.1.0:
-rem   [+] Added PLAYWRIGHT_BROWSERS_PATH to use isolated Chromium from project.
-rem
-rem Patchnote v1.0.0:
-rem   [+] Initial launch script.
-rem ---------------------------------------------------------
+:: ---------------------------------------------------------
+:: /run_ai_everynyan.bat
+:: Version: 1.1.0
+:: Author:  Soror L.'.L.'.
+:: Updated: 2026-04-23
+::
+:: Patchnote v1.1.0:
+::   [+] Added PLAYWRIGHT_BROWSERS_PATH to use isolated Chromium from project.
+::
+:: Patchnote v1.0.0:
+::   [+] Initial launch script.
+:: ---------------------------------------------------------
 
 @echo off
 chcp 65001 >nul

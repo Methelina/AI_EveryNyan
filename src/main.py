@@ -4,21 +4,31 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.16.3 (MCP fix for llama mode)
+Version:     0.17.2 (Full reporting restored in dump_context_to_memory and shutdown)
 Author:      Soror L.'.L.'.
-Updated:     2026-04-24
+Updated:     2026-04-29
 
-Patch Notes v0.16.3 [pytraveler]:
-  [FIX] MCP agent now initializes correctly in llama mode (chat_mode="llama").
-        LlamaChatModel lacks bind_tools() (NotImplementedError in BaseChatModel),
-        so a ChatOpenAI wrapper is created for the react agent in llama mode,
-        leveraging the OpenAI-compatible API of llama-server.
-  [+] Improved MCP init error logging: full exception type name and traceback
-      instead of empty "Failed to initialize MCP agent: ".
+Patch Notes v0.17.2:
+  [FIX] Restored detailed logging in dump_context_to_memory: each section save/skip reason.
+  [FIX] Graceful shutdown now reports pending message count and dump status.
+  [FIX] Final exit also shows detailed context persistence report.
+  [*] No functional changes, only reporting improvements.
 
-Patch Notes v0.16.2:
-  [+] MCP agent logging: tool calls and results are displayed in SYSTEM LOG with colors.
-  [+] Added error handling for agent execution.
+Patch Notes v0.17.1:
+  [FIX] Backend URLs are read-only from settings.yaml (user cannot change IP in GUI).
+  [FIX] Model fetching works separately for Ollama (/api/tags) and LLaMA (/v1/models).
+  [FIX] Refresh button (⟳) loads models for currently selected backend.
+  [FIX] chat_mode from YAML is only initial; GUI toggle takes full control.
+  [+] Added automatic fallback for LLaMA model list (if /v1/models fails, shows current model).
+  [*] Removed editable base_url/api_key from GUI to prevent misconfiguration.
+
+Patch Notes v0.17.0 [Soror L.'.L.'.]:
+  [MAJOR] New right-side control panel for real-time configuration:
+    - Switch between Ollama and Llama backends for chat without restart.
+    - Edit temperature, max_tokens, timeout.
+    - Fetch available models from Ollama/LLaMA and apply via dropdown.
+    - Reset all runtime settings to values from settings.yaml.
+  [*] GUI layout redesigned: chat area + system log + control panel side-by-side.
 """
 
 import os
@@ -34,6 +44,7 @@ import requests
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Union, Literal, Callable
 from datetime import datetime
+from copy import deepcopy
 
 import dearpygui.dearpygui as dpg
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
@@ -290,21 +301,6 @@ class AppSettings(BaseSettings):
             logger.warning("Custom embedding mode not implemented, falling back to ollama")
             return self.ollama
 
-    def get_chat_config(self):
-        if self.chat_mode == "ollama":
-            return self.ollama
-        else:
-            return self.llama
-
-    def get_embedding_config(self):
-        if self.embedding_mode == "ollama":
-            return self.ollama
-        else:
-            logger.warning(
-                "Custom embedding mode not implemented, falling back to ollama"
-            )
-            return self.ollama
-
 
 # ============================================================================
 # Character Configuration
@@ -373,6 +369,13 @@ async_thread: Optional[threading.Thread] = None
 _shutting_down: bool = False
 _current_ai_message_tag = None
 
+# ------------------------------------------------------------
+# Runtime overrides (for dynamic GUI changes)
+# ------------------------------------------------------------
+runtime_chat_mode: str = "ollama"          # will be synced with settings.chat_mode
+runtime_embed_mode: str = "ollama"         # synced with settings.embedding_mode
+runtime_chat_params: Dict[str, Any] = {}   # temperature, max_tokens, timeout, model, base_url, api_key
+runtime_embed_params: Dict[str, Any] = {}  # model, base_url, api_key
 
 # ============================================================================
 # AI Thoughts UI System
@@ -431,7 +434,6 @@ def submit_to_async(coro) -> asyncio.Future:
 # ============================================================================
 # Component Initialization
 # ============================================================================
-
 
 def init_components():
     global qdrant_client, vector_store, llm, embeddings
@@ -530,7 +532,7 @@ def _to_lc_messages(raw_msgs: list[dict]) -> list:
             result.append(SystemMessage(content=content))
     return result
 
-# import traceback
+
 async def init_mcp_agent():
     global mcp_client, react_agent
     try:
@@ -615,6 +617,327 @@ def init_query_preprocessor():
     global query_preprocessor
     query_preprocessor = QueryPreprocessor(add_thought_callback=add_ai_thought)
     logger.info("QueryPreprocessor initialized (spaCy lemmatization).")
+
+
+# ============================================================================
+# Dynamic runtime reconfiguration (NEW for v0.17.0)
+# ============================================================================
+
+def reinit_llm():
+    """Recreate llm global using current runtime_chat_mode and runtime_chat_params."""
+    global llm, react_agent
+    mode = runtime_chat_mode
+    params = runtime_chat_params.copy()
+    logger.info(f"[DYNAMIC] Reinitializing LLM: mode={mode}, params={params}")
+
+    if mode == "ollama":
+        llm = ChatOpenAI(
+            model=params.get("model", settings.ollama.chat_model),
+            openai_api_key=params.get("api_key", settings.ollama.api_key),
+            openai_api_base=params.get("base_url", settings.ollama.base_url),
+            temperature=params.get("temperature", settings.ollama.temperature),
+            timeout=params.get("timeout", settings.ollama.timeout),
+            max_tokens=params.get("max_tokens", settings.ollama.max_tokens),
+            streaming=False
+        )
+        logger.info("LLM reinitialized as ChatOpenAI (Ollama)")
+    else:  # llama
+        api_key = params.get("api_key", settings.llama.api_key) or "not-needed"
+        llm = LlamaChatModel(
+            base_url=params.get("base_url", settings.llama.base_url),
+            model=params.get("model", settings.llama.chat_model),
+            api_key=api_key,
+            timeout=params.get("timeout", settings.llama.timeout),
+            temperature=params.get("temperature", settings.llama.temperature),
+            max_tokens=params.get("max_tokens", settings.llama.max_tokens)
+        )
+        logger.info("LLM reinitialized as LlamaChatModel")
+    
+    # Reinitialize MCP agent with new LLM (if needed)
+    if react_agent:
+        try:
+            # Re-fetch tools and recreate agent with new model
+            asyncio.run_coroutine_threadsafe(_recreate_mcp_agent(), async_loop)
+        except Exception as e:
+            logger.warning(f"Could not reinit MCP agent: {e}")
+
+
+async def _recreate_mcp_agent():
+    global mcp_client, react_agent
+    if mcp_client:
+        raw_tools = await mcp_client.get_tools()
+        if raw_tools:
+            from langchain_core.tools import StructuredTool
+            from langgraph.prebuilt import create_react_agent
+
+            def unwrap_tool(original_tool):
+                async def _wrapper(**kwargs):
+                    result = await original_tool.ainvoke(kwargs)
+                    if isinstance(result, list) and result and isinstance(result[0], dict):
+                        text_parts = [item.get('text', '') for item in result if item.get('type') == 'text']
+                        if text_parts:
+                            return "\n".join(text_parts)
+                    return str(result)
+                return StructuredTool.from_function(
+                    coroutine=_wrapper,
+                    name=original_tool.name,
+                    description=original_tool.description,
+                    args_schema=original_tool.args_schema,
+                )
+            tools = [unwrap_tool(t) for t in raw_tools]
+            agent_model = llm
+            if runtime_chat_mode != "ollama":
+                agent_model = ChatOpenAI(
+                    model=runtime_chat_params.get("model", settings.llama.chat_model),
+                    openai_api_key=runtime_chat_params.get("api_key", "not-needed"),
+                    openai_api_base=runtime_chat_params.get("base_url", settings.llama.base_url),
+                    temperature=runtime_chat_params.get("temperature", settings.llama.temperature),
+                    timeout=runtime_chat_params.get("timeout", settings.llama.timeout),
+                    max_tokens=runtime_chat_params.get("max_tokens", settings.llama.max_tokens),
+                    streaming=False,
+                )
+            react_agent = create_react_agent(model=agent_model, tools=tools)
+            logger.info("[MCP] React agent reinitialized after chat change")
+
+
+def reinit_embeddings():
+    """Recreate embeddings global using runtime_embed_mode and runtime_embed_params."""
+    global embeddings, vector_store
+    mode = runtime_embed_mode
+    params = runtime_embed_params.copy()
+    logger.info(f"[DYNAMIC] Reinitializing embeddings: mode={mode}, params={params}")
+
+    if mode == "ollama":
+        embeddings = OpenAIEmbeddings(
+            model=params.get("model", settings.ollama.embedding_model),
+            openai_api_key=params.get("api_key", settings.ollama.api_key),
+            openai_api_base=params.get("base_url", settings.ollama.base_url),
+            check_embedding_ctx_length=False,
+        )
+    else:
+        # For llama mode we fallback to Ollama (or you can implement custom)
+        logger.warning("Embedding mode 'llama' not supported, falling back to Ollama")
+        embeddings = OpenAIEmbeddings(
+            model=settings.ollama.embedding_model,
+            openai_api_key=settings.ollama.api_key,
+            openai_api_base=settings.ollama.base_url,
+            check_embedding_ctx_length=False,
+        )
+    # Recreate vector store with new embeddings
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=settings.vector_db.collection,
+        embedding=embeddings
+    )
+    logger.info("Embeddings and vector store reinitialized")
+
+
+def fetch_models_from_backend(backend_type: str, base_url: str, api_key: str = "") -> List[str]:
+    """Fetch available models from Ollama (/api/tags) or LLaMA (/v1/models)."""
+    try:
+        if backend_type == "ollama":
+            # Ollama API: /api/tags
+            base = base_url.replace("/v1", "")
+            response = requests.get(f"{base}/api/tags", timeout=5)
+            if response.status_code == 200:
+                models = [m["name"] for m in response.json().get("models", [])]
+                return models
+        else:  # llama / OpenAI-compatible
+            # Try /v1/models endpoint
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            response = requests.get(f"{base_url}/models", headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                models = [m["id"] for m in data.get("data", [])]
+                return models
+            else:
+                # fallback: return current model from runtime
+                return [runtime_chat_params.get("model", "unknown")]
+    except Exception as e:
+        logger.warning(f"Failed to fetch models from {backend_type}: {e}")
+    return []
+
+
+def refresh_models_list():
+    """Called when refresh button is clicked - fetches models for current chat backend and updates combo."""
+    backend = dpg.get_value("chat_mode_radio")
+    if backend == "ollama":
+        url = settings.ollama.base_url
+        api_key = settings.ollama.api_key
+    else:
+        url = settings.llama.base_url
+        api_key = settings.llama.api_key
+    
+    models = fetch_models_from_backend(backend, url, api_key)
+    if models:
+        dpg.configure_item("chat_model_combo", items=models)
+        current_model = runtime_chat_params.get("model")
+        if current_model in models:
+            dpg.set_value("chat_model_combo", current_model)
+        else:
+            dpg.set_value("chat_model_combo", models[0])
+        dpg.set_value("chat_model_hidden", dpg.get_value("chat_model_combo"))
+        add_ai_thought(f"[GUI] Loaded {len(models)} models from {backend}", (100,255,100))
+    else:
+        add_ai_thought(f"[GUI] Failed to fetch models from {backend}", (255,100,100))
+
+
+def on_chat_mode_changed(sender, app_data):
+    """When user toggles between ollama/llama, reset to fixed URL and fetch new model list."""
+    global runtime_chat_mode
+    new_mode = app_data
+    runtime_chat_mode = new_mode
+    # Reset parameters from settings.yaml (fixed)
+    if new_mode == "ollama":
+        runtime_chat_params.update({
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+            "model": settings.ollama.chat_model,
+            "temperature": settings.ollama.temperature,
+            "max_tokens": settings.ollama.max_tokens,
+            "timeout": settings.ollama.timeout,
+        })
+    else:
+        runtime_chat_params.update({
+            "base_url": settings.llama.base_url,
+            "api_key": settings.llama.api_key,
+            "model": settings.llama.chat_model,
+            "temperature": settings.llama.temperature,
+            "max_tokens": settings.llama.max_tokens,
+            "timeout": settings.llama.timeout,
+        })
+    # Update UI fields
+    dpg.set_value("chat_temp", runtime_chat_params["temperature"])
+    dpg.set_value("chat_max_tokens", runtime_chat_params["max_tokens"])
+    dpg.set_value("chat_timeout", runtime_chat_params["timeout"])
+    dpg.set_value("chat_model_hidden", runtime_chat_params["model"])
+    # Refresh model list for new backend
+    refresh_models_list()
+    # Apply the new settings immediately
+    apply_chat_settings(runtime_chat_params)
+
+
+def on_embed_mode_changed(sender, app_data):
+    """When embedding backend toggled, update runtime and reinit embeddings."""
+    global runtime_embed_mode
+    runtime_embed_mode = app_data
+    # For embeddings, only Ollama is fully supported; if "llama" is chosen, fallback to Ollama.
+    if runtime_embed_mode == "ollama":
+        runtime_embed_params.update({
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        })
+    else:
+        # Fallback to Ollama (LLaMA doesn't provide embedding endpoint)
+        runtime_embed_params.update({
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        })
+        add_ai_thought("[GUI] LLaMA backend for embeddings not supported, using Ollama", (255,200,100))
+    reinit_embeddings()
+    add_ai_thought(f"[GUI] Embedding backend set to {runtime_embed_mode}", (100,255,100))
+
+
+def apply_chat_settings(ui_values: dict):
+    """Apply new chat settings from UI and reinit LLM. (URL/api_key are taken from runtime_params)"""
+    global runtime_chat_mode, runtime_chat_params
+    # Ensure URL and api_key are not overwritten from UI (they are fixed)
+    chat_mode_from_ui = ui_values.get("chat_mode")
+    if chat_mode_from_ui:
+        runtime_chat_mode = chat_mode_from_ui
+        # Reset base_url/api_key from settings.yaml for this mode
+        if runtime_chat_mode == "ollama":
+            runtime_chat_params["base_url"] = settings.ollama.base_url
+            runtime_chat_params["api_key"] = settings.ollama.api_key
+        else:
+            runtime_chat_params["base_url"] = settings.llama.base_url
+            runtime_chat_params["api_key"] = settings.llama.api_key
+    
+    # Update other parameters
+    runtime_chat_params.update({
+        "model": ui_values.get("model", runtime_chat_params.get("model")),
+        "temperature": ui_values.get("temperature", runtime_chat_params.get("temperature")),
+        "max_tokens": ui_values.get("max_tokens", runtime_chat_params.get("max_tokens")),
+        "timeout": ui_values.get("timeout", runtime_chat_params.get("timeout")),
+    })
+    # Remove None values
+    runtime_chat_params = {k: v for k, v in runtime_chat_params.items() if v is not None}
+    reinit_llm()
+    add_ai_thought(f"[GUI] Chat settings applied: mode={runtime_chat_mode}, model={runtime_chat_params.get('model')}")
+
+
+def apply_embedding_settings(ui_values: dict):
+    """Apply new embedding settings and reinit embeddings + vector store."""
+    global runtime_embed_mode, runtime_embed_params
+    runtime_embed_mode = ui_values.get("embed_mode", runtime_embed_mode)
+    # For embeddings, only Ollama is supported; ignore user's choice of "llama"
+    if runtime_embed_mode == "ollama":
+        runtime_embed_params.update({
+            "model": ui_values.get("model", settings.ollama.embedding_model),
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        })
+    else:
+        # fallback to Ollama
+        runtime_embed_params.update({
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        })
+        add_ai_thought("[GUI] LLaMA backend for embeddings not supported, using Ollama", (255,200,100))
+    runtime_embed_params = {k: v for k, v in runtime_embed_params.items() if v is not None}
+    reinit_embeddings()
+    add_ai_thought(f"[GUI] Embedding settings applied: mode={runtime_embed_mode}, model={runtime_embed_params.get('model')}")
+
+
+def reset_to_yaml_defaults():
+    """Reset all runtime parameters to values from settings.yaml."""
+    global runtime_chat_mode, runtime_embed_mode, runtime_chat_params, runtime_embed_params, settings
+    # Reload settings from file (in case file changed)
+    config_path = Path("config/settings.yaml")
+    settings = AppSettings.from_yaml(str(config_path))
+    
+    runtime_chat_mode = settings.chat_mode
+    runtime_embed_mode = settings.embedding_mode
+    
+    # Chat defaults
+    if runtime_chat_mode == "ollama":
+        runtime_chat_params = {
+            "model": settings.ollama.chat_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+            "temperature": settings.ollama.temperature,
+            "max_tokens": settings.ollama.max_tokens,
+            "timeout": settings.ollama.timeout,
+        }
+    else:
+        runtime_chat_params = {
+            "model": settings.llama.chat_model,
+            "base_url": settings.llama.base_url,
+            "api_key": settings.llama.api_key,
+            "temperature": settings.llama.temperature,
+            "max_tokens": settings.llama.max_tokens,
+            "timeout": settings.llama.timeout,
+        }
+    # Embedding defaults
+    if settings.embedding_mode == "ollama":
+        runtime_embed_params = {
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        }
+    else:
+        runtime_embed_params = {
+            "model": settings.ollama.embedding_model,   # fallback to ollama model
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        }
+    # Reinitialize components
+    reinit_llm()
+    reinit_embeddings()
+    add_ai_thought("[GUI] Reset to settings.yaml defaults", (100,255,100))
 
 
 # ============================================================================
@@ -708,31 +1031,6 @@ async def keyword_search_in_history(query: str, limit: int = 3) -> str:
         return ""
 
 
-async def keyword_search_in_history(query: str, limit: int = 3) -> str:
-    if not memory_manager:
-        return ""
-    keywords = [w for w in query.lower().split() if len(w) > 3]
-    if not keywords:
-        return ""
-    try:
-        conn = memory_manager.conn
-        conditions = " OR ".join([f"LOWER(content) LIKE '%{kw}%'" for kw in keywords])
-        rows = conn.execute(f"""
-            SELECT role, content, timestamp FROM chat_history
-            WHERE {conditions} ORDER BY timestamp DESC LIMIT ?
-        """, [limit]).fetchall()
-        if not rows:
-            return ""
-        result_parts = []
-        for role, content, ts in rows:
-            sender = "User" if role == 'user' else "AI"
-            result_parts.append(f"[{ts}] {sender}: {content[:300]}")
-        return "\n\n".join(result_parts)
-    except Exception as e:
-        logger.warning(f"Keyword search failed: {e}")
-        return ""
-
-
 async def check_plagiarism(text: str, threshold: float) -> bool:
     if not vector_store or not qdrant_client:
         return False
@@ -794,6 +1092,7 @@ async def dump_context_to_memory():
         return
     msg_count = len(session_context)
     add_ai_thought(f"[SUM] START: processing {msg_count} messages", (200,200,100))
+    # Показываем первые 5 сообщений для контекста
     for i, msg in enumerate(session_context[:5]):
         add_ai_thought(f"  [{i}] {msg['role']}: {msg['content'][:40]}...", (150,150,180))
     try:
@@ -804,7 +1103,6 @@ async def dump_context_to_memory():
             response = await llm.ainvoke(full_prompt)
             diary_entry = response.content
         else:
-            # Unified approach using ainvoke for LlamaChatModel too
             response = await llm.ainvoke(full_prompt)
             diary_entry = response.content
             
@@ -812,8 +1110,11 @@ async def dump_context_to_memory():
         sections = [s.strip() for s in diary_entry.split("---") if s.strip()]
         total_sections = len(sections)
         saved_count = 0
+        skipped_count = 0
         for idx, section in enumerate(sections):
             if len(section) < 20:
+                add_ai_thought(f"  [SKIP] Section {idx+1} too short (<20 chars)", (255,200,100))
+                skipped_count += 1
                 continue
             json_str = "{}"
             json_block = re.search(r'```json\s*(\{.*?\})\s*```', section, re.DOTALL)
@@ -832,16 +1133,24 @@ async def dump_context_to_memory():
             except Exception as e:
                 logger.warning(f"JSON parse fallback: {e}")
                 parsed_meta = DiaryEntryMetadata(**base_meta)
+            
+            # Проверка на плагиат (дублирование)
             if await check_plagiarism(clean_section, settings.diary.plagiarism_threshold):
+                add_ai_thought(f"  [SKIP] Section {idx+1} duplicate (plagiarism threshold)", (255,150,150))
+                skipped_count += 1
                 continue
+                
             if query_preprocessor:
                 lemmatized = query_preprocessor.lemmatize_text(clean_section, remove_stopwords=False)
                 parsed_meta.type_specific["lemmatized"] = lemmatized
+            
             vector_store.add_texts(texts=[clean_section], metadatas=[parsed_meta.to_qdrant_payload()])
             if memory_manager:
                 memory_manager.save_diary_summary(text=clean_section, index=idx, total=total_sections, meta=parsed_meta)
             saved_count += 1
-        add_ai_thought(f"[DB] FINISH: {saved_count}/{total_sections} stored", (100,255,100))
+            add_ai_thought(f"  [SAVE] Section {idx+1}/{total_sections} stored (len={len(clean_section)})", (100,255,100))
+        
+        add_ai_thought(f"[DB] FINISH: {saved_count} saved, {skipped_count} skipped (from {total_sections} sections)", (100,255,100))
         session_context.clear()
     except Exception as e:
         logger.error(f"dump_context_to_memory failed: {e}")
@@ -958,7 +1267,7 @@ async def process_message(user_text: str) -> str:
                 logger.error(f"MCP agent execution failed: {agent_err}", exc_info=True)
                 add_ai_thought(f"[MCP] Agent error: {agent_err}. Falling back to direct LLM.", (255, 100, 100))
                 # fallback to direct LLM (ollama or llama)
-                if settings.chat_mode == "ollama":
+                if runtime_chat_mode == "ollama":
                     response = await llm.ainvoke(messages)
                     content = response.content
                 else:
@@ -1009,7 +1318,7 @@ async def process_message(user_text: str) -> str:
                 )
             if reasoning:
                 add_ai_thought(f"[REASONING]\n{reasoning}", (180, 180, 150))
-        elif settings.chat_mode == "ollama":
+        elif runtime_chat_mode == "ollama":
             response = await llm.ainvoke(messages)
             content = response.content
             reasoning = response.response_metadata.get("reasoning_content", "") or ""
@@ -1094,35 +1403,6 @@ async def save_to_memory(user_text: str, ai_response: str):
 # GUI
 # ============================================================================
 
-
-async def report_qdrant_status():
-    if not qdrant_client:
-        add_ai_thought("[RAG] Status: Qdrant client not available", (200,150,150))
-        return
-    try:
-        info = qdrant_client.get_collection(settings.vector_db.collection)
-        add_ai_thought(f"[RAG] Qdrant collection '{settings.vector_db.collection}': {info.points_count} vectors", (150,255,150))
-        scroll = qdrant_client.scroll(collection_name=settings.vector_db.collection, limit=3, with_payload=True, with_vectors=False)
-        for p in scroll[0]:
-            ts = p.payload.get("metadata", {}).get("timestamp", "no timestamp")
-            preview = str(p.payload.get("page_content", ""))[:60]
-            add_ai_thought(f"  - {ts}: {preview}...", (180,180,180))
-    except Exception as e:
-        add_ai_thought(f"[RAG] Status error: {e}", (255,100,100))
-
-
-def on_memory_report():
-    add_ai_thought("[SYS] Generating memory report...", (200,200,100))
-    submit_to_async(report_qdrant_status())
-    if memory_manager:
-        stats = memory_manager.get_stats()
-        add_ai_thought(f"[DB] DuckDB: {stats.get('total_messages',0)} msgs, {stats.get('total_summaries',0)} summaries", (150,255,150))
-        summaries = memory_manager.get_diary_summaries(limit=3)
-        if summaries:
-            for s in summaries:
-                add_ai_thought(f"  - {s['timestamp']}: {s['text'][:80]}...", (180,180,180))
-
-
 def find_available_font() -> Optional[str]:
     local = Path("data/fonts")
     for f in ["JetBrainsMonoNerdFont-Regular.ttf", "JetBrainsMonoNerdFont-Medium.ttf", "JetBrainsMonoNerdFont-Bold.ttf"]:
@@ -1152,30 +1432,119 @@ def setup_gui():
                 dpg.add_theme_color(dpg.mvThemeCol_Header, (50,50,80))
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (220,220,220))
         dpg.bind_theme(dark_theme)
+
     with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False):
-        with dpg.child_window(tag="chat_area", height=-200, border=False):
-            if memory_manager:
-                history = memory_manager.get_recent_history(limit=50)
-                for msg in history:
-                    color = (100,200,255) if msg['role'] == 'user' else (255,200,100)
-                    sender = "You" if msg['role'] == 'user' else "AI_EveryNyan"
-                    with dpg.group(horizontal=False):
-                        with dpg.group(horizontal=True):
-                            dpg.add_text(f"{sender}:", color=color)
-                        with dpg.group(indent=20):
-                            dpg.add_text(msg['content'], wrap=max(200, dpg.get_viewport_width()-150))
-                        dpg.add_spacer(height=5)
-            else:
-                dpg.add_text("Welcome to AI_EveryNyan!", color=(150,150,200))
-        with dpg.child_window(tag="ai_thoughts_area", height=120, label="[SYSTEM] LOG", border=True):
-            dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100,100,100))
         with dpg.group(horizontal=True):
-            dpg.add_input_text(tag="user_input", width=-180, hint="Type your message...", on_enter=True, callback=on_send_message)
-            dpg.add_button(label="Send", callback=on_send_message, width=80)
-            dpg.add_button(label="Memory Report", callback=on_memory_report, width=100)
-        dpg.add_text("", tag="status_text", color=(100,100,100))
+            # LEFT: Chat area
+            with dpg.child_window(width=-300, border=False):
+                with dpg.child_window(tag="chat_area", height=-200, border=False):
+                    if memory_manager:
+                        history = memory_manager.get_recent_history(limit=50)
+                        for msg in history:
+                            color = (100,200,255) if msg['role'] == 'user' else (255,200,100)
+                            sender = "You" if msg['role'] == 'user' else "AI_EveryNyan"
+                            with dpg.group(horizontal=False):
+                                with dpg.group(horizontal=True):
+                                    dpg.add_text(f"{sender}:", color=color)
+                                with dpg.group(indent=20):
+                                    dpg.add_text(msg['content'], wrap=max(200, dpg.get_viewport_width()-450))
+                                dpg.add_spacer(height=5)
+                    else:
+                        dpg.add_text("Welcome to AI_EveryNyan!", color=(150,150,200))
+                with dpg.child_window(tag="ai_thoughts_area", height=120, label="[SYSTEM] LOG", border=True):
+                    dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100,100,100))
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(tag="user_input", width=-180, hint="Type your message...", on_enter=True, callback=on_send_message)
+                    dpg.add_button(label="Send", callback=on_send_message, width=80)
+                    dpg.add_button(label="Memory Report", callback=on_memory_report, width=100)
+                dpg.add_text("", tag="status_text", color=(100,100,100))
+
+            # RIGHT: Control Panel
+            with dpg.child_window(width=300, border=True, label="Control Panel"):
+                # Chat backend selection (fixed URLs from settings.yaml)
+                dpg.add_text("Chat Backend", color=(200,200,255))
+                dpg.add_radio_button(tag="chat_mode_radio", items=["ollama", "llama"], default_value=runtime_chat_mode, horizontal=True, callback=on_chat_mode_changed)
+                
+                # Fixed backend endpoints (read-only info)
+                dpg.add_text(f"Ollama URL: {settings.ollama.base_url}", color=(150,150,200))
+                dpg.add_text(f"LLaMA URL: {settings.llama.base_url}", color=(150,150,200))
+                
+                # Model selection with refresh button
+                with dpg.group(horizontal=True):
+                    dpg.add_combo(tag="chat_model_combo", label="Model", width=-50, default_value=runtime_chat_params.get("model", ""), callback=lambda s,a: dpg.set_value("chat_model_hidden", a))
+                    dpg.add_button(label="⟳", tag="refresh_models_btn", callback=lambda: refresh_models_list(), width=40)
+                dpg.add_input_text(tag="chat_model_hidden", default_value=runtime_chat_params.get("model", ""), show=False)  # hidden storage
+                
+                # Temperature, max_tokens, timeout (editable)
+                dpg.add_input_float(tag="chat_temp", label="Temperature", default_value=runtime_chat_params.get("temperature", 0.7), step=0.05, min_value=0.0, max_value=2.0)
+                dpg.add_input_int(tag="chat_max_tokens", label="Max tokens", default_value=runtime_chat_params.get("max_tokens", 2048), step=256, min_value=1)
+                dpg.add_input_int(tag="chat_timeout", label="Timeout (s)", default_value=runtime_chat_params.get("timeout", 120), step=10, min_value=10)
+                dpg.add_button(label="Apply Chat Settings", callback=apply_chat_from_ui)
+                dpg.add_spacer(height=10)
+
+                # Embedding settings (fixed backends, only Ollama really works)
+                dpg.add_text("Embedding Backend", color=(200,255,200))
+                dpg.add_radio_button(tag="embed_mode_radio", items=["ollama", "llama"], default_value=runtime_embed_mode, horizontal=True, callback=on_embed_mode_changed)
+                dpg.add_text(f"Ollama URL: {settings.ollama.base_url}", color=(150,150,200))
+                dpg.add_text(f"Embedding model: {settings.ollama.embedding_model}", color=(150,150,200))
+                dpg.add_button(label="Apply Embedding Settings", callback=apply_embed_from_ui)
+                dpg.add_spacer(height=10)
+
+                # Reset button
+                dpg.add_button(label="Reset to settings.yaml", callback=lambda: reset_to_yaml_defaults_and_update_ui())
+                dpg.add_spacer(height=5)
+                dpg.add_text("Note: Changing embedding model requires same vector dimension.", color=(200,150,100))
+
     dpg.setup_dearpygui()
     dpg.show_viewport()
+
+
+# ============================================================================
+# GUI callbacks for control panel
+# ============================================================================
+
+def apply_chat_from_ui():
+    """Apply chat settings from UI (model, temperature, max_tokens, timeout). URL/api_key are fixed."""
+    ui_vals = {
+        "chat_mode": dpg.get_value("chat_mode_radio"),
+        "model": dpg.get_value("chat_model_hidden"),
+        "temperature": dpg.get_value("chat_temp"),
+        "max_tokens": dpg.get_value("chat_max_tokens"),
+        "timeout": dpg.get_value("chat_timeout"),
+    }
+    # URL and api_key are taken from fixed runtime params, not from UI
+    if ui_vals["chat_mode"] == "ollama":
+        ui_vals["base_url"] = runtime_chat_params.get("base_url", settings.ollama.base_url)
+        ui_vals["api_key"] = runtime_chat_params.get("api_key", settings.ollama.api_key)
+    else:
+        ui_vals["base_url"] = runtime_chat_params.get("base_url", settings.llama.base_url)
+        ui_vals["api_key"] = runtime_chat_params.get("api_key", settings.llama.api_key)
+    
+    apply_chat_settings(ui_vals)
+
+
+def apply_embed_from_ui():
+    ui_vals = {
+        "embed_mode": dpg.get_value("embed_mode_radio"),
+        "model": dpg.get_value("embed_model"),
+        "base_url": dpg.get_value("embed_base_url"),
+        "api_key": dpg.get_value("embed_api_key"),
+    }
+    apply_embedding_settings(ui_vals)
+
+
+def reset_to_yaml_defaults_and_update_ui():
+    reset_to_yaml_defaults()
+    # Update UI fields with new runtime values
+    dpg.set_value("chat_mode_radio", runtime_chat_mode)
+    dpg.set_value("chat_model_hidden", runtime_chat_params.get("model", ""))
+    dpg.set_value("chat_temp", runtime_chat_params.get("temperature", 0.7))
+    dpg.set_value("chat_max_tokens", runtime_chat_params.get("max_tokens", 2048))
+    dpg.set_value("chat_timeout", runtime_chat_params.get("timeout", 120))
+    dpg.set_value("embed_mode_radio", runtime_embed_mode)
+    # Refresh model list for current backend
+    refresh_models_list()
+    add_ai_thought("[GUI] Reset to settings.yaml defaults", (100,255,100))
 
 
 def add_chat_message(sender: str, text: str, color: tuple):
@@ -1184,7 +1553,7 @@ def add_chat_message(sender: str, text: str, color: tuple):
         with dpg.group(horizontal=True):
             dpg.add_text(f"{sender}:", color=color)
         with dpg.group(indent=20):
-            dpg.add_text(text, wrap=max(200, dpg.get_viewport_width()-150))
+            dpg.add_text(text, wrap=max(200, dpg.get_viewport_width()-450))
         dpg.add_spacer(height=5)
     dpg.set_y_scroll("chat_area", 1e9)
 
@@ -1228,6 +1597,34 @@ async def handle_async_response(user_text: str):
         add_ai_thought(f"[ERR] Handler Error: {e}", (255,100,100))
 
 
+async def report_qdrant_status():
+    if not qdrant_client:
+        add_ai_thought("[RAG] Status: Qdrant client not available", (200,150,150))
+        return
+    try:
+        info = qdrant_client.get_collection(settings.vector_db.collection)
+        add_ai_thought(f"[RAG] Qdrant collection '{settings.vector_db.collection}': {info.points_count} vectors", (150,255,150))
+        scroll = qdrant_client.scroll(collection_name=settings.vector_db.collection, limit=3, with_payload=True, with_vectors=False)
+        for p in scroll[0]:
+            ts = p.payload.get("metadata", {}).get("timestamp", "no timestamp")
+            preview = str(p.payload.get("page_content", ""))[:60]
+            add_ai_thought(f"  - {ts}: {preview}...", (180,180,180))
+    except Exception as e:
+        add_ai_thought(f"[RAG] Status error: {e}", (255,100,100))
+
+
+def on_memory_report():
+    add_ai_thought("[SYS] Generating memory report...", (200,200,100))
+    submit_to_async(report_qdrant_status())
+    if memory_manager:
+        stats = memory_manager.get_stats()
+        add_ai_thought(f"[DB] DuckDB: {stats.get('total_messages',0)} msgs, {stats.get('total_summaries',0)} summaries", (150,255,150))
+        summaries = memory_manager.get_diary_summaries(limit=3)
+        if summaries:
+            for s in summaries:
+                add_ai_thought(f"  - {s['timestamp']}: {s['text'][:80]}...", (180,180,180))
+
+
 # ============================================================================
 # Graceful Shutdown
 # ============================================================================
@@ -1238,18 +1635,28 @@ def initiate_graceful_shutdown():
     if _shutting_down:
         return
     _shutting_down = True
-    add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255,150,150))
+    
+    # Подсчитываем, сколько несохранённых сообщений в контексте
+    unsaved_count = len(session_context)
+    add_ai_thought(f"[SYS] SHUTDOWN: {unsaved_count} unsaved messages in context", (255,150,150))
+    
     dpg.configure_item("user_input", enabled=False)
     dpg.set_value("status_text", "Saving memories...")
+    
     if session_context:
+        add_ai_thought(f"[SYS] SHUTDOWN: Dumping context to long-term memory...", (255,200,100))
         try:
             future = asyncio.run_coroutine_threadsafe(
                 dump_context_to_memory(), async_loop
             )
             future.result(timeout=30)
-            add_ai_thought("[SYS] STATUS: Save complete.", (150,255,150))
+            add_ai_thought("[SYS] STATUS: Context dump complete.", (150,255,150))
         except Exception as e:
             logger.error(f"Shutdown dump failed: {e}")
+            add_ai_thought(f"[ERR] Shutdown dump failed: {e}", (255,100,100))
+    else:
+        add_ai_thought("[SYS] SHUTDOWN: No context to save.", (200,200,100))
+    
     dpg.stop_dearpygui()
 
 
@@ -1264,7 +1671,7 @@ def signal_handler(signum, frame):
 
 
 def main():
-    global settings, async_loop, async_thread
+    global settings, async_loop, async_thread, runtime_chat_mode, runtime_embed_mode, runtime_chat_params, runtime_embed_params
     config_path = Path("config/settings.yaml")
     settings = AppSettings.from_yaml(str(config_path))
     Path(settings.diary.storage_dir).mkdir(parents=True, exist_ok=True)
@@ -1272,15 +1679,52 @@ def main():
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)
 
+    # Initialize runtime overrides from yaml
+    runtime_chat_mode = settings.chat_mode
+    runtime_embed_mode = settings.embedding_mode
+    if runtime_chat_mode == "ollama":
+        runtime_chat_params = {
+            "model": settings.ollama.chat_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+            "temperature": settings.ollama.temperature,
+            "max_tokens": settings.ollama.max_tokens,
+            "timeout": settings.ollama.timeout,
+        }
+    else:
+        runtime_chat_params = {
+            "model": settings.llama.chat_model,
+            "base_url": settings.llama.base_url,
+            "api_key": settings.llama.api_key,
+            "temperature": settings.llama.temperature,
+            "max_tokens": settings.llama.max_tokens,
+            "timeout": settings.llama.timeout,
+        }
+    if settings.embedding_mode == "ollama":
+        runtime_embed_params = {
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        }
+    else:
+        runtime_embed_params = {
+            "model": settings.ollama.embedding_model,
+            "base_url": settings.ollama.base_url,
+            "api_key": settings.ollama.api_key,
+        }
+
     if settings.debug:
         logging_exceptions.install_excepthook()
 
-    logger.info(f"Starting AI_EveryNyan v0.16.2 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.17.2 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     init_memory_manager()
     init_components()
+    # Override with runtime overrides (so GUI works without another restart)
+    reinit_llm()
+    reinit_embeddings()
     init_character()
 
     async_loop = asyncio.new_event_loop()
@@ -1290,6 +1734,8 @@ def main():
     async_thread.start()
 
     setup_gui()
+    # Initial model list refresh
+    refresh_models_list()
     init_query_preprocessor()
 
     future = asyncio.run_coroutine_threadsafe(init_mcp_agent(), async_loop)
@@ -1302,15 +1748,19 @@ def main():
     try:
         dpg.start_dearpygui()
     finally:
-        add_ai_thought("[SYS] SHUTDOWN: Saving data...", (255, 150, 150))
+        add_ai_thought(f"[SYS] SHUTDOWN: {len(session_context)} pending messages", (255,150,150))
         if session_context:
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     dump_context_to_memory(), async_loop
                 )
                 future.result(timeout=300)
+                add_ai_thought("[SYS] Final context dump successful.", (150,255,150))
             except Exception as e:
                 logger.error(f"Final dump failed: {e}")
+                add_ai_thought(f"[ERR] Final dump failed: {e}", (255,100,100))
+        else:
+            add_ai_thought("[SYS] No context to save on exit.", (200,200,100))
         if mcp_client:
             logger.info("[MCP] Client released (no explicit close needed)")
         async_loop.call_soon_threadsafe(async_loop.stop)
@@ -1319,6 +1769,7 @@ def main():
             memory_manager.close()
         dpg.destroy_context()
         logger.info("[SYS] Shutdown complete.")
+        add_ai_thought("[SYS] Goodbye!", (100,255,100))
 
 
 if __name__ == "__main__":
