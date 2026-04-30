@@ -1,0 +1,126 @@
+{
+  "subject_type": "human (nekomimi / catgirl)",
+  "character_name": "EveryNyan",
+  "origin": "Original character (C++ KuniCharacter.cpp)",
+  "short_visual_description": "A young anime-style catgirl with shoulder-length blue hair and cat ears, leaning forward on a wooden table in a sunlit room. Her eyes are large and bright blue with white catchlights. She has a playful or surprised expression, mouth open showing cute fangs. Her shoulders and chest are bare, and she wears a dark corset with intricate gold lace trim. Small dust particles float in the air around her.",
+  "age_estimate": "18yo",
+  "height_cm": "about 164 cm (5 ft 4.5 in)",
+  "race": "nekomimi (catgirl)",
+  "gender": "female",
+  "face_shape": "oval / heart-shaped with soft cheeks",
+  "measurements_cm": {
+    "bust": "88",
+    "waist": "62",
+    "hips": "88",
+    "high_hips": "80",
+    "back_waist": "39",
+    "front_waist": "33",
+    "inseam": "75",
+    "sleeve_length": "55",
+    "legs_length_3_4": "36",
+    "full_legs_length": "92"
+  },
+  "breast_type": "medium",
+  "cap_size": "B",
+  "constitution": "Slim, thin, with a soft feminine figure, almost flat buttocks",
+  "anatomy": {
+    "body_type": "Slender, lean frame with soft curves",
+    "height_proportion": "Average height slightly below 165 cm, delicate but not waifish",
+    "distinctive_anatomy": [
+      "Pair of cat ears on top of the head, covered in blue fur matching hair color",
+      "Large expressive blue eyes with prominent white reflections",
+      "Small, cute fangs visible when mouth is open",
+      "Bare shoulders and upper chest (exposed skin)",
+      "Almost flat buttocks (visually confirmed)",
+      "Small nose and rosy cheeks"
+    ]
+  },
+  "hair": {
+    "color": "Dark blue with lighter (sky blue) highlights and messy strands",
+    "style": "Shoulder-length with layered strands, slightly tousled or windblown",
+    "texture": "Soft, slightly glossy with lighter reflections on the crown",
+    "bangs": "Parted in the middle, framing the face, some strands falling over the forehead"
+  },
+  "face": {
+    "shape": "Oval / heart with soft jawline",
+    "forehead": "Smooth, moderately high",
+    "skin_tone": "Warm peach / light pink with natural rosy blush on cheeks",
+    "eyebrows": {
+      "color": "Dark blue (matching hair)",
+      "thickness": "Thin, arched",
+      "shape": "Slightly curved upward, expressive"
+    },
+    "eyes": {
+      "shape": "Large, almond-shaped with slight tilt",
+      "size": "Large relative to face (typical anime style)",
+      "color": "Bright blue / cerulean with lighter gradient",
+      "iris_detail": "Clear pupil, multiple white catchlights (sparkle)",
+      "lower_lids": "Minimal or no shadow lines (youthful appearance)",
+      "lashes": "Distinct black eyelashes, prominent on upper lid"
+    },
+    "nose": {
+      "size": "Small, subtle dot",
+      "shape": "Cute, rounded at the tip"
+    },
+    "mouth": {
+      "shape": "Small, slightly open (as if speaking or surprised)",
+      "color": "Light coral pink",
+      "position": "Centered, slightly below the nose",
+      "special_features": "Small cat fangs visible on upper teeth"
+    },
+    "ears": {
+      "type": "Cat ears (nekomimi)",
+      "length": "Medium, triangular, protruding from the hair",
+      "angle": "Pointing slightly upward and outward, with tufts of fur at tips",
+      "texture": "Furry with blue fur and pink inner ear skin visible"
+    }
+  },
+  "expression_microexpressions": {
+    "dominant_mood": "Playful, surprised, curious",
+    "baseline_expression": "Warm, friendly, slightly mischievous",
+    "variations": [
+      {
+        "state": "Playful / Surprised",
+        "description": "Eyes wide open with bright catchlights, mouth open showing fangs, eyebrows slightly raised, rosy cheeks enhanced"
+      },
+      {
+        "state": "Neutral / Curious",
+        "description": "Eyes softly open, mouth closed or slightly parted, head tilted slightly to the side, cat ears perked forward"
+      },
+      {
+        "state": "Happy / Smiling",
+        "description": "Eyes crinkled slightly, closed into happy arcs, mouth in a gentle smile, fangs may still peek out"
+      }
+    ],
+    "key_tells": "Cute cat fangs visible when speaking or surprised, bright wide eyes, expressive cat ears that move with emotion"
+  },
+  "outfit": [
+    {
+      "item": "Corset-style top",
+      "description": "Dark (black or dark blue) corset garment with intricate gold lace pattern along the neckline and armholes. It covers the lower chest and midriff, leaving shoulders and upper chest completely bare.",
+      "collar": "None (strapless / off-the-shoulder design)"
+    },
+    {
+      "item": "Bottoms (inferred)",
+      "description": "While not visible in the description, based on context and the corset top, she likely wears matching dark shorts, a skirt, or panties (not visible in frame). For completeness: dark blue or black shorts / skirt."
+    },
+    {
+      "item": "Footwear (inferred)",
+      "description": "As no footwear is mentioned, a fitting choice for an indoor setting with a wooden table: she might be barefoot or wearing cozy house slippers / socks. For a consistent catgirl aesthetic, barefoot with soft paws or simple knitted socks is appropriate."
+    }
+  ],
+  "footwear": "barefoot (indoor) or soft socks/slippers",
+  "accessories": {
+    "earrings": "None visible or described",
+    "weapon": "None",
+    "other": "Floating dust/sparkle particles in the air around her (atmospheric effect)"
+  },
+  "pose": "leaning forward slightly towards the viewer, resting arms or chest on a wooden table surface",
+  "body_parts_details": "Upper body (head to mid-torso) visible. Bare shoulders, collarbones, and upper chest area exposed. Cat ears clearly visible on top of head. Messy blue hair strands falling around the face. Mouth open showing teeth and small fangs. Chest has mild cleavage due to corset cut.",
+  "erotical_assets": "suggestive (bare shoulders and upper chest, corset with lace trim, but no nudity)",
+  "posture_and_action": {
+    "sitting": "Leaning forward on a wooden table, upper body angled toward the viewer",
+    "standing": "Not depicted in this description",
+    "mood": "Playful, curious, slightly surprised. The cat ears and open mouth with fangs suggest a lively, energetic personality."
+  }
+}
