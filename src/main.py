@@ -4,9 +4,28 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 \src\main.py
-Version:     0.17.2 (Full reporting restored in dump_context_to_memory and shutdown)
-Author:      Soror L.'.L.'.
-Updated:     2026-04-29
+Version:     0.17.5 (Persistent JSON projections for character appearance)
+Author:      Soror L.'.L.'. 
+Updated:     2026-04-30
+
+Patch Notes v0.17.5:
+  [FEATURE] Character appearance now managed via projection files in config/character/reprojection/.
+  [FEATURE] Projections persist across restarts; fallback to originals on corruption.
+  [FEATURE] Full JSON appearance injected into system prompt as a single line.
+  [Pydantic] AppearanceProjection model for validation.
+  [*] Prepared for future MCP tool integration to edit projections.
+
+Patch Notes v0.17.4:
+  [FEATURE] Character appearance now loaded from config/character/appearance_*.json files.
+  [GUI] Added character dropdown selector and Update button in Control Panel.
+  [*] Default personality remains "EveryNyan"; falls back to YAML if no JSON files found.
+
+Patch Notes v0.17.3:
+  [GUI] Splitter between chat and AI log is now draggable (dynamic heights).
+  [GUI] Main window fills viewport automatically (set as primary).
+  [GUI] AI thoughts multiline text now wraps correctly inside its child window.
+  [GUI] Model refresh button uses ↻ symbol.
+  [FIX] Replaced set_resize_callback with item_handler_registry for left_panel resize.
 
 Patch Notes v0.17.2:
   [FIX] Restored detailed logging in dump_context_to_memory: each section save/skip reason.
@@ -303,6 +322,22 @@ class AppSettings(BaseSettings):
 
 
 # ============================================================================
+# Character Appearance Projection Pydantic Model (v0.17.5)
+# ============================================================================
+
+class AppearanceProjection(BaseModel):
+    """Minimal validation model for projection JSON files.
+    Future tools must preserve at least these fields."""
+    character_name: str
+    # We allow either freeform or short_visual_description
+    freeform: Optional[str] = None
+    short_visual_description: Optional[str] = None
+    # Everything else is captured with extra="allow"
+    class Config:
+        extra = "allow"
+
+
+# ============================================================================
 # Character Configuration
 # ============================================================================
 
@@ -320,6 +355,8 @@ class CharacterAppearanceConfig(BaseModel):
 class CharacterConfig:
     BASE_PATH = Path("config/character/base.yaml")
     APPEARANCE_PATH = Path("config/character/appearance.yaml")
+    APPERANCE_JSON_DIR = Path("config/character")
+    REPROJECTION_DIR = Path("config/character/reprojection")
 
     @staticmethod
     def _load_yaml_file(filepath: Path, model: type[BaseModel]) -> BaseModel:
@@ -341,6 +378,73 @@ class CharacterConfig:
     def load_appearance(cls) -> CharacterAppearanceConfig:
         return cls._load_yaml_file(cls.APPEARANCE_PATH, CharacterAppearanceConfig)
 
+    @classmethod
+    def load_appearance_json_files(cls) -> Dict[str, dict]:
+        """
+        Scan config/character/ for appearance_*.json files.
+        Returns a dict mapping character_name → raw json payload.
+        """
+        appearance_map = {}
+        if not cls.APPERANCE_JSON_DIR.exists():
+            return appearance_map
+        for fpath in sorted(cls.APPERANCE_JSON_DIR.glob("appearance_*.json")):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                name = data.get("character_name", fpath.stem)
+                appearance_map[name] = data
+            except Exception as e:
+                logger.warning(f"Skipping invalid appearance JSON: {fpath} ({e})")
+        return appearance_map
+
+    @classmethod
+    def get_projection_path(cls, character_name: str) -> Path:
+        """Return the path for a projection file."""
+        return cls.REPROJECTION_DIR / f"appearance_{character_name}.projection.json"
+
+    @classmethod
+    def create_projection_from_original(cls, character_name: str, original_data: dict) -> Optional[dict]:
+        """
+        Save original_data as a projection file.
+        Returns the data if successful, None on failure.
+        """
+        cls.REPROJECTION_DIR.mkdir(parents=True, exist_ok=True)
+        projection_path = cls.get_projection_path(character_name)
+        try:
+            with open(projection_path, "w", encoding="utf-8") as f:
+                json.dump(original_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"Created projection for {character_name}")
+            return original_data
+        except Exception as e:
+            logger.error(f"Failed to create projection for {character_name}: {e}")
+            return None
+
+    @classmethod
+    def load_projection(cls, character_name: str, original_data: dict) -> Optional[dict]:
+        """
+        Load projection JSON. If missing or invalid, recreate from original.
+        Returns the loaded dictionary or None if unrecoverable.
+        """
+        projection_path = cls.get_projection_path(character_name)
+        # If no projection file, create from original
+        if not projection_path.exists():
+            return cls.create_projection_from_original(character_name, original_data)
+
+        # Try to read and validate
+        try:
+            with open(projection_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Validate required structure
+            AppearanceProjection.model_validate(data)
+            # Ensure character_name matches (consistency check)
+            if data.get("character_name") != character_name:
+                logger.warning(f"Projection mismatch for {character_name}, recreating from original")
+                return cls.create_projection_from_original(character_name, original_data)
+            return data
+        except (json.JSONDecodeError, ValidationError, Exception) as e:
+            logger.warning(f"Projection for {character_name} is invalid ({e}), recreating from original")
+            return cls.create_projection_from_original(character_name, original_data)
+
 
 # ============================================================================
 # Global Objects & State
@@ -348,7 +452,13 @@ class CharacterConfig:
 
 settings: Optional[AppSettings] = None
 character_base: Optional[CharacterBaseConfig] = None
-character_appearance: Optional[CharacterAppearanceConfig] = None
+character_appearance: Optional[CharacterAppearanceConfig] = None      # Fallback from YAML
+
+# New JSON appearance globals (v0.17.4+)
+appearance_map: Dict[str, dict] = {}                                  # character name → original dict
+current_character_name: str = "EveryNyan"                             # default
+current_projection_path: Optional[Path] = None                        # path to active projection
+# Note: current_appearance dict is now always read fresh from file in build_system_prompt()
 
 qdrant_client: Optional[QdrantClient] = None
 vector_store: Optional[QdrantVectorStore] = None
@@ -377,6 +487,11 @@ runtime_embed_mode: str = "ollama"         # synced with settings.embedding_mode
 runtime_chat_params: Dict[str, Any] = {}   # temperature, max_tokens, timeout, model, base_url, api_key
 runtime_embed_params: Dict[str, Any] = {}  # model, base_url, api_key
 
+# ------------------------------------------------------------
+# GUI splitter state (NEW for v0.17.3)
+# ------------------------------------------------------------
+split_bottom_height: int = 120   # initial height of AI thoughts area
+
 # ============================================================================
 # AI Thoughts UI System
 # ============================================================================
@@ -390,7 +505,7 @@ def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
         timestamp = datetime.now().strftime("%H:%M:%S")
         with dpg.group(parent="ai_thoughts_area", horizontal=True):
             dpg.add_text(f"[{timestamp}] ", color=(100, 100, 100))
-            dpg.add_text(text, color=color)
+            dpg.add_text(text, color=color, wrap=-1)   # wrap=-1 исправляет обрезание
         dpg.set_y_scroll("ai_thoughts_area", 1e9)
     except Exception as e:
         logger.debug(f"Thought UI update skipped: {e}")
@@ -405,7 +520,7 @@ def update_ai_message_streaming(text: str):
             with dpg.group(horizontal=True):
                 dpg.add_text("AI_EveryNyan:", color=(255,200,100))
             with dpg.group(indent=20):
-                _current_ai_message_tag = dpg.add_text(text, wrap=max(200, dpg.get_viewport_width()-150))
+                _current_ai_message_tag = dpg.add_text(text, wrap=-1)   # wrap=-1
         dpg.set_y_scroll("chat_area", 1e9)
 
 
@@ -429,6 +544,48 @@ def submit_to_async(coro) -> asyncio.Future:
         logger.warning("Async loop not ready, running synchronously")
         return asyncio.run(coro)
     return asyncio.run_coroutine_threadsafe(coro, async_loop)
+
+
+# ============================================================================
+# GUI Splitter Management (NEW for v0.17.3)
+# ============================================================================
+
+def update_split_heights():
+    """Recalculate heights of chat_area and ai_thoughts_area based on split_bottom_height."""
+    if not dpg.does_item_exist("left_panel"):
+        return
+    try:
+        left_height = dpg.get_item_rect_size("left_panel")[1]
+    except:
+        return
+    if left_height <= 0:
+        return
+    global split_bottom_height
+    min_bottom = 50
+    max_bottom = max(min_bottom, left_height - 100)  # leave at least 100px for chat
+    bottom = min(max(split_bottom_height, min_bottom), max_bottom)
+    chat_height = left_height - bottom - 5  # 5px for separator
+    if chat_height < 50:
+        chat_height = 50
+        bottom = left_height - chat_height - 5
+        if bottom < min_bottom:
+            bottom = min_bottom
+    dpg.configure_item("chat_area", height=chat_height)
+    dpg.configure_item("ai_thoughts_area", height=bottom)
+    split_bottom_height = bottom
+
+
+def on_separator_drag(sender, app_data):
+    """Mouse drag callback for the splitter bar."""
+    global split_bottom_height
+    dy = app_data[1]
+    split_bottom_height -= dy
+    update_split_heights()
+
+
+def on_left_panel_resize():
+    """Called when left panel is resized (by viewport changes)."""
+    update_split_heights()
 
 
 # ============================================================================
@@ -498,11 +655,45 @@ def init_components():
 
 
 def init_character():
-    global character_base, character_appearance
+    global character_base, character_appearance, appearance_map, current_character_name, current_projection_path
     logger.info("Loading character configuration...")
     character_base = CharacterConfig.load_base()
-    character_appearance = CharacterConfig.load_appearance()
+    
+    # Always try to load JSON appearance files
+    appearance_map = CharacterConfig.load_appearance_json_files()
+    
+    if appearance_map:
+        # Determine default: use "EveryNyan" if available else first in alphabetical order
+        if "EveryNyan" in appearance_map:
+            current_character_name = "EveryNyan"
+        else:
+            current_character_name = sorted(appearance_map.keys())[0]
+        # Load or create projection for the selected character
+        _ensure_projection_for_current()
+        character_appearance = None                                 # we won't use YAML fallback
+        logger.info(f"JSON appearances loaded. Active: {current_character_name}")
+    else:
+        # Fallback to YAML appearance.yaml
+        character_appearance = CharacterConfig.load_appearance()
+        current_projection_path = None
+        current_character_name = "EveryNyan"                        # assume YAML defines EveryNyan
+        logger.info("No appearance_*.json found. Falling back to appearance.yaml")
+    
     logger.info("Character brain loaded correctly. All systems nominal")
+
+
+def _ensure_projection_for_current():
+    """Create/load projection for the current_character_name."""
+    global current_projection_path
+    if current_character_name not in appearance_map:
+        logger.warning(f"Cannot create projection: {current_character_name} not in appearance_map")
+        return
+    original = appearance_map[current_character_name]
+    data = CharacterConfig.load_projection(current_character_name, original)
+    if data:
+        current_projection_path = CharacterConfig.get_projection_path(current_character_name)
+    else:
+        current_projection_path = None
 
 
 def init_memory_manager():
@@ -552,11 +743,9 @@ async def init_mcp_agent():
 
         raw_tools = await mcp_client.get_tools()
         if raw_tools:
-            # Обёртка: извлекаем текст из списка, который возвращает MCP
             def unwrap_tool(original_tool):
                 async def _wrapper(**kwargs):
                     result = await original_tool.ainvoke(kwargs)
-                    # Типичный результат от MCP: [{'type': 'text', 'text': '...'}]
                     if isinstance(result, list) and result and isinstance(result[0], dict):
                         text_parts = [item.get('text', '') for item in result if item.get('type') == 'text']
                         if text_parts:
@@ -570,9 +759,6 @@ async def init_mcp_agent():
                 )
             tools = [unwrap_tool(t) for t in raw_tools]
 
-            # LlamaChatModel не реализует bind_tools() (NotImplementedError в BaseChatModel).
-            # Для react-agent создаём ChatOpenAI, т.к. llama-server предоставляет
-            # OpenAI-совместимый API с поддержкой function/tool calling.
             agent_model = llm
             if settings.chat_mode != "ollama":
                 chat_cfg = settings.get_chat_config()
@@ -613,11 +799,6 @@ async def init_mcp_agent():
         mcp_client = None
         react_agent = None
 
-def init_query_preprocessor():
-    global query_preprocessor
-    query_preprocessor = QueryPreprocessor(add_thought_callback=add_ai_thought)
-    logger.info("QueryPreprocessor initialized (spaCy lemmatization).")
-
 
 # ============================================================================
 # Dynamic runtime reconfiguration (NEW for v0.17.0)
@@ -653,10 +834,8 @@ def reinit_llm():
         )
         logger.info("LLM reinitialized as LlamaChatModel")
     
-    # Reinitialize MCP agent with new LLM (if needed)
     if react_agent:
         try:
-            # Re-fetch tools and recreate agent with new model
             asyncio.run_coroutine_threadsafe(_recreate_mcp_agent(), async_loop)
         except Exception as e:
             logger.warning(f"Could not reinit MCP agent: {e}")
@@ -715,7 +894,6 @@ def reinit_embeddings():
             check_embedding_ctx_length=False,
         )
     else:
-        # For llama mode we fallback to Ollama (or you can implement custom)
         logger.warning("Embedding mode 'llama' not supported, falling back to Ollama")
         embeddings = OpenAIEmbeddings(
             model=settings.ollama.embedding_model,
@@ -723,7 +901,6 @@ def reinit_embeddings():
             openai_api_base=settings.ollama.base_url,
             check_embedding_ctx_length=False,
         )
-    # Recreate vector store with new embeddings
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=settings.vector_db.collection,
@@ -736,14 +913,12 @@ def fetch_models_from_backend(backend_type: str, base_url: str, api_key: str = "
     """Fetch available models from Ollama (/api/tags) or LLaMA (/v1/models)."""
     try:
         if backend_type == "ollama":
-            # Ollama API: /api/tags
             base = base_url.replace("/v1", "")
             response = requests.get(f"{base}/api/tags", timeout=5)
             if response.status_code == 200:
                 models = [m["name"] for m in response.json().get("models", [])]
                 return models
-        else:  # llama / OpenAI-compatible
-            # Try /v1/models endpoint
+        else:
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
             response = requests.get(f"{base_url}/models", headers=headers, timeout=5)
             if response.status_code == 200:
@@ -751,7 +926,6 @@ def fetch_models_from_backend(backend_type: str, base_url: str, api_key: str = "
                 models = [m["id"] for m in data.get("data", [])]
                 return models
             else:
-                # fallback: return current model from runtime
                 return [runtime_chat_params.get("model", "unknown")]
     except Exception as e:
         logger.warning(f"Failed to fetch models from {backend_type}: {e}")
@@ -787,7 +961,6 @@ def on_chat_mode_changed(sender, app_data):
     global runtime_chat_mode
     new_mode = app_data
     runtime_chat_mode = new_mode
-    # Reset parameters from settings.yaml (fixed)
     if new_mode == "ollama":
         runtime_chat_params.update({
             "base_url": settings.ollama.base_url,
@@ -806,14 +979,11 @@ def on_chat_mode_changed(sender, app_data):
             "max_tokens": settings.llama.max_tokens,
             "timeout": settings.llama.timeout,
         })
-    # Update UI fields
     dpg.set_value("chat_temp", runtime_chat_params["temperature"])
     dpg.set_value("chat_max_tokens", runtime_chat_params["max_tokens"])
     dpg.set_value("chat_timeout", runtime_chat_params["timeout"])
     dpg.set_value("chat_model_hidden", runtime_chat_params["model"])
-    # Refresh model list for new backend
     refresh_models_list()
-    # Apply the new settings immediately
     apply_chat_settings(runtime_chat_params)
 
 
@@ -821,7 +991,6 @@ def on_embed_mode_changed(sender, app_data):
     """When embedding backend toggled, update runtime and reinit embeddings."""
     global runtime_embed_mode
     runtime_embed_mode = app_data
-    # For embeddings, only Ollama is fully supported; if "llama" is chosen, fallback to Ollama.
     if runtime_embed_mode == "ollama":
         runtime_embed_params.update({
             "model": settings.ollama.embedding_model,
@@ -829,7 +998,6 @@ def on_embed_mode_changed(sender, app_data):
             "api_key": settings.ollama.api_key,
         })
     else:
-        # Fallback to Ollama (LLaMA doesn't provide embedding endpoint)
         runtime_embed_params.update({
             "model": settings.ollama.embedding_model,
             "base_url": settings.ollama.base_url,
@@ -843,11 +1011,9 @@ def on_embed_mode_changed(sender, app_data):
 def apply_chat_settings(ui_values: dict):
     """Apply new chat settings from UI and reinit LLM. (URL/api_key are taken from runtime_params)"""
     global runtime_chat_mode, runtime_chat_params
-    # Ensure URL and api_key are not overwritten from UI (they are fixed)
     chat_mode_from_ui = ui_values.get("chat_mode")
     if chat_mode_from_ui:
         runtime_chat_mode = chat_mode_from_ui
-        # Reset base_url/api_key from settings.yaml for this mode
         if runtime_chat_mode == "ollama":
             runtime_chat_params["base_url"] = settings.ollama.base_url
             runtime_chat_params["api_key"] = settings.ollama.api_key
@@ -855,14 +1021,12 @@ def apply_chat_settings(ui_values: dict):
             runtime_chat_params["base_url"] = settings.llama.base_url
             runtime_chat_params["api_key"] = settings.llama.api_key
     
-    # Update other parameters
     runtime_chat_params.update({
         "model": ui_values.get("model", runtime_chat_params.get("model")),
         "temperature": ui_values.get("temperature", runtime_chat_params.get("temperature")),
         "max_tokens": ui_values.get("max_tokens", runtime_chat_params.get("max_tokens")),
         "timeout": ui_values.get("timeout", runtime_chat_params.get("timeout")),
     })
-    # Remove None values
     runtime_chat_params = {k: v for k, v in runtime_chat_params.items() if v is not None}
     reinit_llm()
     add_ai_thought(f"[GUI] Chat settings applied: mode={runtime_chat_mode}, model={runtime_chat_params.get('model')}")
@@ -872,7 +1036,6 @@ def apply_embedding_settings(ui_values: dict):
     """Apply new embedding settings and reinit embeddings + vector store."""
     global runtime_embed_mode, runtime_embed_params
     runtime_embed_mode = ui_values.get("embed_mode", runtime_embed_mode)
-    # For embeddings, only Ollama is supported; ignore user's choice of "llama"
     if runtime_embed_mode == "ollama":
         runtime_embed_params.update({
             "model": ui_values.get("model", settings.ollama.embedding_model),
@@ -880,7 +1043,6 @@ def apply_embedding_settings(ui_values: dict):
             "api_key": settings.ollama.api_key,
         })
     else:
-        # fallback to Ollama
         runtime_embed_params.update({
             "model": settings.ollama.embedding_model,
             "base_url": settings.ollama.base_url,
@@ -895,14 +1057,12 @@ def apply_embedding_settings(ui_values: dict):
 def reset_to_yaml_defaults():
     """Reset all runtime parameters to values from settings.yaml."""
     global runtime_chat_mode, runtime_embed_mode, runtime_chat_params, runtime_embed_params, settings
-    # Reload settings from file (in case file changed)
     config_path = Path("config/settings.yaml")
     settings = AppSettings.from_yaml(str(config_path))
     
     runtime_chat_mode = settings.chat_mode
     runtime_embed_mode = settings.embedding_mode
     
-    # Chat defaults
     if runtime_chat_mode == "ollama":
         runtime_chat_params = {
             "model": settings.ollama.chat_model,
@@ -921,7 +1081,6 @@ def reset_to_yaml_defaults():
             "max_tokens": settings.llama.max_tokens,
             "timeout": settings.llama.timeout,
         }
-    # Embedding defaults
     if settings.embedding_mode == "ollama":
         runtime_embed_params = {
             "model": settings.ollama.embedding_model,
@@ -930,11 +1089,10 @@ def reset_to_yaml_defaults():
         }
     else:
         runtime_embed_params = {
-            "model": settings.ollama.embedding_model,   # fallback to ollama model
+            "model": settings.ollama.embedding_model,
             "base_url": settings.ollama.base_url,
             "api_key": settings.ollama.api_key,
         }
-    # Reinitialize components
     reinit_llm()
     reinit_embeddings()
     add_ai_thought("[GUI] Reset to settings.yaml defaults", (100,255,100))
@@ -1053,9 +1211,7 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
 
 
 async def _extract_dialogue_metadata(user_text: str, ai_response: str) -> Dict[str, Any]:
-    # Works with both ChatOpenAI and LlamaChatModel as both support ainvoke
     if settings.chat_mode != "ollama":
-        # Для локальных моделей можно пропустить сложное извлечение, если нет инструкций
         return {"entities": [], "topics": [], "key_facts": []}
     prompt = f"""
 Extract metadata from this conversation:
@@ -1092,7 +1248,6 @@ async def dump_context_to_memory():
         return
     msg_count = len(session_context)
     add_ai_thought(f"[SUM] START: processing {msg_count} messages", (200,200,100))
-    # Показываем первые 5 сообщений для контекста
     for i, msg in enumerate(session_context[:5]):
         add_ai_thought(f"  [{i}] {msg['role']}: {msg['content'][:40]}...", (150,150,180))
     try:
@@ -1134,7 +1289,6 @@ async def dump_context_to_memory():
                 logger.warning(f"JSON parse fallback: {e}")
                 parsed_meta = DiaryEntryMetadata(**base_meta)
             
-            # Проверка на плагиат (дублирование)
             if await check_plagiarism(clean_section, settings.diary.plagiarism_threshold):
                 add_ai_thought(f"  [SKIP] Section {idx+1} duplicate (plagiarism threshold)", (255,150,150))
                 skipped_count += 1
@@ -1186,22 +1340,105 @@ def check_anti_repetition_semantic(new_content: str) -> bool:
 
 
 def build_system_prompt() -> str:
-    if not character_base or not character_appearance:
+    if not character_base:
         return "You are a helpful assistant."
+    
+    # Determine visual reference text -------------------------------------------------
+    visual_ref = ""
+    # NEW: read projection file fresh every time to reflect tool edits
+    if current_projection_path and current_projection_path.exists():
+        try:
+            with open(current_projection_path, "r", encoding="utf-8") as f:
+                proj_data = json.load(f)
+            # Validate projection structure
+            AppearanceProjection.model_validate(proj_data)
+            # Insert the entire JSON as a single line
+            visual_ref = json.dumps(proj_data, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to load projection {current_projection_path}: {e}, falling back to original")
+            # Fallback to original JSON if available
+            if current_character_name in appearance_map:
+                visual_ref = json.dumps(appearance_map[current_character_name], ensure_ascii=False)
+            else:
+                visual_ref = f"Appearance of {current_character_name}"
+    elif character_appearance:   # YAML fallback (no JSON files at all)
+        visual_ref = character_appearance.freeform
+    else:
+        visual_ref = f"Appearance of {current_character_name}"
+    # --------------------------------------------------------------------------------
+
     return f"""{character_base.prompt}
 
 <visual_reference>
-{character_appearance.freeform}
+{visual_ref}
 </visual_reference>
 
 <instructions>
-- В начале диалога ты можешь увидеть блок "Я вспоминаю:" — это твои собственные воспоминания, извлечённые из долговременной памяти.
-- ОБЯЗАТЕЛЬНО используй эту информацию, чтобы ответить пользователю. Если там есть конкретные факты, упомяни их.
-- Не придумывай то, чего нет в воспоминаниях. Если нужной информации нет, честно скажи об этом.
-- Будь милой, дружелюбной, оставайся в образе EveryNyan.
-- Отвечай от первого лица, используй she/her.
-- Не используй markdown, если не просят.
+- Regardless of any name mentioned in your personality description, your active character name is exactly "{current_character_name}". Always use this name for tool calls and self-reference.
+- At the beginning of the dialogue you may see a "Я вспоминаю:" block – these are your own memories retrieved from long-term storage.
+- You MUST use this information to answer the user. If specific facts are present, mention them.
+- Do not invent anything not contained in the memories. If the requested information is not there, honestly say so or use a proper network search tools you have to search info.
+- Stay in character. Be cute, friendly, and warm.
+- Speak in first person, using she/her pronouns.
+- Always reply in natural conversational language. Do NOT use Markdown formatting, tables, code fences, JSON blocks, or any special markup, unless the user explicitly asks for it (e.g., "show me the JSON", "format as a table").
+- Your current appearance is completely described inside the <visual_reference> block above. This is the **only** reliable source of information about how you look right now.
+- Ignore any appearance descriptions found in the dialogue history, in memories, or in your own previous answers – those may be outdated or incorrect. <visual_reference> is only source of your appearacne in any time and moment.
+- When asked to describe your appearance, always use the fields from the JSON object in <visual_reference> (outfit, hair, eyes, accessories, height, measurements_cm, etc.).
+- If the user requests a change to your appearance, use the update_character_appearance tool, providing the exact character name and a clear description of the desired change.
 </instructions>"""
+
+
+# ============================================================================
+# Character Selection UI Helpers (v0.17.5)
+# ============================================================================
+
+def refresh_character_list():
+    """Rescan appearance JSON files, update combo box and current selection."""
+    global appearance_map, current_character_name, current_projection_path
+    # Reload JSON map
+    appearance_map = CharacterConfig.load_appearance_json_files()
+    
+    if not dpg.does_item_exist("character_combo"):
+        return   # GUI not yet created
+    
+    if appearance_map:
+        names = sorted(appearance_map.keys())
+        dpg.configure_item("character_combo", items=names)
+        # Keep current name if still present, else set to first
+        if current_character_name not in appearance_map:
+            current_character_name = names[0]
+        dpg.set_value("character_combo", current_character_name)
+        _ensure_projection_for_current()
+        add_ai_thought(f"[GUI] Character list refreshed ({len(appearance_map)} appearances)", (100,255,100))
+    else:
+        # No JSON → fallback to YAML
+        dpg.configure_item("character_combo", items=["EveryNyan (YAML)"])
+        dpg.set_value("character_combo", "EveryNyan (YAML)")
+        current_character_name = "EveryNyan"
+        current_projection_path = None
+        character_appearance = CharacterConfig.load_appearance()   # reload YAML fallback
+        add_ai_thought("[GUI] No JSON appearances, using YAML fallback", (255,200,100))
+
+
+def on_character_selected(sender, app_data):
+    """Called when user picks a character from the combo box."""
+    global current_character_name, current_projection_path, character_appearance
+    selected = app_data
+    # If the item indicates YAML fallback, handle separately
+    if selected == "EveryNyan (YAML)":
+        current_character_name = "EveryNyan"
+        current_projection_path = None
+        character_appearance = CharacterConfig.load_appearance()
+        add_ai_thought(f"[GUI] Switched to YAML appearance: {current_character_name}", (100,255,100))
+        return
+    
+    if selected in appearance_map:
+        current_character_name = selected
+        _ensure_projection_for_current()
+        character_appearance = None   # we are in JSON mode
+        add_ai_thought(f"[GUI] Switched appearance to: {selected}", (100,255,100))
+    else:
+        logger.warning(f"Attempted to select unknown character: {selected}")
 
 
 # ============================================================================
@@ -1266,7 +1503,6 @@ async def process_message(user_text: str) -> str:
             except Exception as agent_err:
                 logger.error(f"MCP agent execution failed: {agent_err}", exc_info=True)
                 add_ai_thought(f"[MCP] Agent error: {agent_err}. Falling back to direct LLM.", (255, 100, 100))
-                # fallback to direct LLM (ollama or llama)
                 if runtime_chat_mode == "ollama":
                     response = await llm.ainvoke(messages)
                     content = response.content
@@ -1281,29 +1517,21 @@ async def process_message(user_text: str) -> str:
                 finalize_ai_message_streaming()
                 return content
 
-            # ========== MCP TOOL LOGGING ==========
             for msg in result["messages"]:
-                # Tool call request (AIMessage with tool_calls)
                 if hasattr(msg, 'tool_calls') and msg.tool_calls:
                     for tc in msg.tool_calls:
                         tool_name = tc.get('name', 'unknown')
                         tool_args = tc.get('args', {})
-                        # Жёлтый цвет для вызова инструмента
                         add_ai_thought(f"[TOOL] Call: {tool_name} args={tool_args}", (255, 220, 100))
                         logger.info(f"MCP TOOL CALL: {tool_name} {tool_args}")
                 
-                # Tool result (ToolMessage)
                 if isinstance(msg, ToolMessage):
                     tool_name = getattr(msg, 'name', 'unknown')
                     result_preview = msg.content[:200] + ('...' if len(msg.content) > 200 else '')
-                    # Зелёный цвет для успешного результата
                     add_ai_thought(f"[TOOL] Result from {tool_name}: {result_preview}", (100, 255, 100))
                     logger.info(f"MCP TOOL RESULT ({tool_name}): {msg.content}")
-                    
-                    # Если в результате есть явная ошибка - покажем красным
                     if "error" in msg.content.lower() or "exception" in msg.content.lower():
                         add_ai_thought(f"[TOOL] Error in {tool_name}: {msg.content[:300]}", (255, 100, 100))
-            # ======================================
             
             content = result["messages"][-1].content
             final_msg = result["messages"][-1]
@@ -1325,7 +1553,6 @@ async def process_message(user_text: str) -> str:
             if reasoning:
                 add_ai_thought(f"[REASONING]\n{reasoning}", (180,180,150))
         else: 
-            # LLaMA Mode - streaming
             full_content = ""
             full_reasoning = ""
             async for chunk in llm.astream(messages):
@@ -1398,7 +1625,6 @@ async def save_to_memory(user_text: str, ai_response: str):
         except Exception as e:
             logger.warning(f"Failed to save to Qdrant: {e}")
 
-
 # ============================================================================
 # GUI
 # ============================================================================
@@ -1414,6 +1640,42 @@ def find_available_font() -> Optional[str]:
             return f
     return None
 
+
+def on_chat_area_resize():
+    """Вызывается, когда пользователь меняет размер chat_area (тянет за край)."""
+    update_split_heights()
+
+
+def on_left_panel_resize():
+    """Called when left panel is resized (by viewport changes)."""
+    update_split_heights()
+
+
+def update_split_heights():
+    """Подгоняет высоту ai_thoughts_area под оставшееся место после chat_area."""
+    if not dpg.does_item_exist("left_panel") or not dpg.does_item_exist("chat_area"):
+        return
+    try:
+        left_height = dpg.get_item_rect_size("left_panel")[1]
+        chat_height = dpg.get_item_rect_size("chat_area")[1]
+    except:
+        return
+    # Примерная высота панели ввода + отступы
+    input_area_height = 35
+    new_log_height = left_height - chat_height - input_area_height
+    if new_log_height < 50:
+        new_log_height = 50
+    dpg.configure_item("ai_thoughts_area", height=new_log_height)
+
+def add_chat_message(sender: str, text: str, color: tuple):
+    dpg.set_y_scroll("chat_area", 1e9)
+    with dpg.group(parent="chat_area", horizontal=False):
+        with dpg.group(horizontal=True):
+            dpg.add_text(f"{sender}:", color=color)
+        with dpg.group(indent=20):
+            dpg.add_text(text, wrap=-1)
+        dpg.add_spacer(height=5)
+    dpg.set_y_scroll("chat_area", 1e9)
 
 def setup_gui():
     dpg.create_context()
@@ -1433,10 +1695,13 @@ def setup_gui():
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (220,220,220))
         dpg.bind_theme(dark_theme)
 
-    with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False):
+    with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False, no_scrollbar=True):
+        dpg.set_primary_window("main_window", True)
+
         with dpg.group(horizontal=True):
-            # LEFT: Chat area
-            with dpg.child_window(width=-300, border=False):
+            # LEFT: левая панель (чат + лог)
+            with dpg.child_window(tag="left_panel", width=-300, border=False, no_scrollbar=True):
+                # Чат – изменяемый размер (тянем за нижний край), СКРОЛЛ ВКЛЮЧЁН
                 with dpg.child_window(tag="chat_area", height=-200, border=False):
                     if memory_manager:
                         history = memory_manager.get_recent_history(limit=50)
@@ -1447,42 +1712,51 @@ def setup_gui():
                                 with dpg.group(horizontal=True):
                                     dpg.add_text(f"{sender}:", color=color)
                                 with dpg.group(indent=20):
-                                    dpg.add_text(msg['content'], wrap=max(200, dpg.get_viewport_width()-450))
+                                    dpg.add_text(msg['content'], wrap=-1)
                                 dpg.add_spacer(height=5)
                     else:
                         dpg.add_text("Welcome to AI_EveryNyan!", color=(150,150,200))
-                with dpg.child_window(tag="ai_thoughts_area", height=120, label="[SYSTEM] LOG", border=True):
+
+                # Лог мыслей ИИ – автоматическая высота, СКРОЛЛ ВКЛЮЧЁН
+                with dpg.child_window(tag="ai_thoughts_area", height=-1, label="[SYSTEM] LOG", border=True):
                     dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100,100,100))
+
+                # Панель ввода
                 with dpg.group(horizontal=True):
                     dpg.add_input_text(tag="user_input", width=-180, hint="Type your message...", on_enter=True, callback=on_send_message)
                     dpg.add_button(label="Send", callback=on_send_message, width=80)
                     dpg.add_button(label="Memory Report", callback=on_memory_report, width=100)
                 dpg.add_text("", tag="status_text", color=(100,100,100))
 
-            # RIGHT: Control Panel
+                # Обработчик: при изменении высоты chat_area пересчитываем лог
+                with dpg.item_handler_registry(tag="chat_resize_handler"):
+                    dpg.add_item_resize_handler(callback=on_chat_area_resize)
+                dpg.bind_item_handler_registry("chat_area", "chat_resize_handler")
+
+                # При изменении размера left_panel тоже пересчитываем
+                with dpg.item_handler_registry(tag="left_panel_resize_handler"):
+                    dpg.add_item_resize_handler(callback=on_left_panel_resize)
+                dpg.bind_item_handler_registry("left_panel", "left_panel_resize_handler")
+
+            # RIGHT: Control Panel (без изменений)
             with dpg.child_window(width=300, border=True, label="Control Panel"):
-                # Chat backend selection (fixed URLs from settings.yaml)
                 dpg.add_text("Chat Backend", color=(200,200,255))
                 dpg.add_radio_button(tag="chat_mode_radio", items=["ollama", "llama"], default_value=runtime_chat_mode, horizontal=True, callback=on_chat_mode_changed)
                 
-                # Fixed backend endpoints (read-only info)
                 dpg.add_text(f"Ollama URL: {settings.ollama.base_url}", color=(150,150,200))
                 dpg.add_text(f"LLaMA URL: {settings.llama.base_url}", color=(150,150,200))
                 
-                # Model selection with refresh button
                 with dpg.group(horizontal=True):
                     dpg.add_combo(tag="chat_model_combo", label="Model", width=-50, default_value=runtime_chat_params.get("model", ""), callback=lambda s,a: dpg.set_value("chat_model_hidden", a))
-                    dpg.add_button(label="⟳", tag="refresh_models_btn", callback=lambda: refresh_models_list(), width=40)
-                dpg.add_input_text(tag="chat_model_hidden", default_value=runtime_chat_params.get("model", ""), show=False)  # hidden storage
+                    dpg.add_button(label="↻", tag="refresh_models_btn", callback=lambda: refresh_models_list(), width=40)
+                dpg.add_input_text(tag="chat_model_hidden", default_value=runtime_chat_params.get("model", ""), show=False)
                 
-                # Temperature, max_tokens, timeout (editable)
                 dpg.add_input_float(tag="chat_temp", label="Temperature", default_value=runtime_chat_params.get("temperature", 0.7), step=0.05, min_value=0.0, max_value=2.0)
                 dpg.add_input_int(tag="chat_max_tokens", label="Max tokens", default_value=runtime_chat_params.get("max_tokens", 2048), step=256, min_value=1)
                 dpg.add_input_int(tag="chat_timeout", label="Timeout (s)", default_value=runtime_chat_params.get("timeout", 120), step=10, min_value=10)
                 dpg.add_button(label="Apply Chat Settings", callback=apply_chat_from_ui)
                 dpg.add_spacer(height=10)
 
-                # Embedding settings (fixed backends, only Ollama really works)
                 dpg.add_text("Embedding Backend", color=(200,255,200))
                 dpg.add_radio_button(tag="embed_mode_radio", items=["ollama", "llama"], default_value=runtime_embed_mode, horizontal=True, callback=on_embed_mode_changed)
                 dpg.add_text(f"Ollama URL: {settings.ollama.base_url}", color=(150,150,200))
@@ -1490,21 +1764,30 @@ def setup_gui():
                 dpg.add_button(label="Apply Embedding Settings", callback=apply_embed_from_ui)
                 dpg.add_spacer(height=10)
 
-                # Reset button
+                # ---- Character Appearance Section (v0.17.4+) ----
+                dpg.add_text("Character Appearance", color=(255,200,100))
+                with dpg.group(horizontal=True):
+                    dpg.add_combo(tag="character_combo", label="Appearance", width=-50, callback=on_character_selected)
+                    dpg.add_button(label="Update", tag="update_char_list_btn", callback=lambda: refresh_character_list(), width=40)
+                dpg.add_spacer(height=5)
+
                 dpg.add_button(label="Reset to settings.yaml", callback=lambda: reset_to_yaml_defaults_and_update_ui())
                 dpg.add_spacer(height=5)
                 dpg.add_text("Note: Changing embedding model requires same vector dimension.", color=(200,150,100))
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
-
+    # Первичное вычисление высот после рендеринга
+    dpg.set_frame_callback(1, update_split_heights)
+    
+    # Populate character combo after GUI is ready
+    refresh_character_list()
 
 # ============================================================================
-# GUI callbacks for control panel
+# GUI callbacks for control panel (без изменений)
 # ============================================================================
 
 def apply_chat_from_ui():
-    """Apply chat settings from UI (model, temperature, max_tokens, timeout). URL/api_key are fixed."""
     ui_vals = {
         "chat_mode": dpg.get_value("chat_mode_radio"),
         "model": dpg.get_value("chat_model_hidden"),
@@ -1512,14 +1795,12 @@ def apply_chat_from_ui():
         "max_tokens": dpg.get_value("chat_max_tokens"),
         "timeout": dpg.get_value("chat_timeout"),
     }
-    # URL and api_key are taken from fixed runtime params, not from UI
     if ui_vals["chat_mode"] == "ollama":
         ui_vals["base_url"] = runtime_chat_params.get("base_url", settings.ollama.base_url)
         ui_vals["api_key"] = runtime_chat_params.get("api_key", settings.ollama.api_key)
     else:
         ui_vals["base_url"] = runtime_chat_params.get("base_url", settings.llama.base_url)
         ui_vals["api_key"] = runtime_chat_params.get("api_key", settings.llama.api_key)
-    
     apply_chat_settings(ui_vals)
 
 
@@ -1535,27 +1816,16 @@ def apply_embed_from_ui():
 
 def reset_to_yaml_defaults_and_update_ui():
     reset_to_yaml_defaults()
-    # Update UI fields with new runtime values
     dpg.set_value("chat_mode_radio", runtime_chat_mode)
     dpg.set_value("chat_model_hidden", runtime_chat_params.get("model", ""))
     dpg.set_value("chat_temp", runtime_chat_params.get("temperature", 0.7))
     dpg.set_value("chat_max_tokens", runtime_chat_params.get("max_tokens", 2048))
     dpg.set_value("chat_timeout", runtime_chat_params.get("timeout", 120))
     dpg.set_value("embed_mode_radio", runtime_embed_mode)
-    # Refresh model list for current backend
     refresh_models_list()
+    # Also refresh character list after reset
+    refresh_character_list()
     add_ai_thought("[GUI] Reset to settings.yaml defaults", (100,255,100))
-
-
-def add_chat_message(sender: str, text: str, color: tuple):
-    dpg.set_y_scroll("chat_area", 1e9)
-    with dpg.group(parent="chat_area", horizontal=False):
-        with dpg.group(horizontal=True):
-            dpg.add_text(f"{sender}:", color=color)
-        with dpg.group(indent=20):
-            dpg.add_text(text, wrap=max(200, dpg.get_viewport_width()-450))
-        dpg.add_spacer(height=5)
-    dpg.set_y_scroll("chat_area", 1e9)
 
 
 def on_send_message(sender, app_data):
@@ -1626,7 +1896,7 @@ def on_memory_report():
 
 
 # ============================================================================
-# Graceful Shutdown
+# Graceful Shutdown (практически без изменений)
 # ============================================================================
 
 
@@ -1636,7 +1906,6 @@ def initiate_graceful_shutdown():
         return
     _shutting_down = True
     
-    # Подсчитываем, сколько несохранённых сообщений в контексте
     unsaved_count = len(session_context)
     add_ai_thought(f"[SYS] SHUTDOWN: {unsaved_count} unsaved messages in context", (255,150,150))
     
@@ -1716,16 +1985,15 @@ def main():
     if settings.debug:
         logging_exceptions.install_excepthook()
 
-    logger.info(f"Starting AI_EveryNyan v0.17.2 (debug={settings.debug})")
+    logger.info(f"Starting AI_EveryNyan v0.17.5 (debug={settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     init_memory_manager()
     init_components()
-    # Override with runtime overrides (so GUI works without another restart)
     reinit_llm()
     reinit_embeddings()
-    init_character()
+    init_character()   # loads appearances and sets current_character_name + projection
 
     async_loop = asyncio.new_event_loop()
     async_thread = threading.Thread(
@@ -1734,7 +2002,6 @@ def main():
     async_thread.start()
 
     setup_gui()
-    # Initial model list refresh
     refresh_models_list()
     init_query_preprocessor()
 
