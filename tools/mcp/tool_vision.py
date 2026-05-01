@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-MCP server providing vision-language tasks using Ollama VL models.
+MCP server providing vision-language tasks using VL models.
 Exposes one tool: describe_image – accepts local path or URL, returns structured JSON description.
 Uses PIL for validation, security (PNG conversion, resize), reads config from settings.yaml.
 
-\\tools\\mcp\\tool_vision.py
+Auto-detects whether the active chat LLM (Ollama or llama.cpp) supports vision
+and preferentially uses it when vision.prefer_chat_model is enabled.
 
-Version:     0.3.3
+/tools/mcp/tool_vision.py
+
+Version:     0.3.4
 Author:      Soror L.'.L.'.
-Updated:     2026-04-29
+Updated:     2026-05-01
+
+Patch Notes v0.3.4 (by pytraveler):
+  [+] Auto-detect vision capability of the active chat LLM (Ollama / llama.cpp).
+  [+] If chat model supports vision and prefer_chat_model is enabled, use it instead
+      of the dedicated vision model.
+  [+] New config key: vision.prefer_chat_model (default: true).
+  [+] OpenAI-compatible multimodal endpoint support for llama.cpp backends.
+  [+] Fallback: if chat model vision call fails, retry with dedicated vision model.
 
 Patch Notes v0.3.3:
   [FIX] Added console debug output when run standalone to verify config loading.
@@ -23,6 +34,7 @@ import os
 import sys
 import base64
 import io
+import json
 import yaml
 import httpx
 from pathlib import Path
@@ -38,47 +50,298 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent   # <repo>/
 CONFIG_PATH = REPO_ROOT / "config" / "settings.yaml"
 
 # ============================================================================
+# LOGGING
+# ============================================================================
+DEBUG_LOG = REPO_ROOT / "logs" / "mcp_vision.log"
+DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+def log_debug(msg: str):
+    timestamp = datetime.now().isoformat()
+    with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{timestamp} {msg}\n")
+
+def report_to_console(msg: str):
+    print(f"[MCP] vision: {msg}", file=sys.stderr, flush=True)
+    log_debug(msg)
+
+# ============================================================================
+# KNOWN VISION MODEL FAMILIES (Ollama details.families)
+# ============================================================================
+VISION_FAMILIES = {
+    "clip", "llava", "llava-llama3", "mllama", "minicpm-v",
+    "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "pixtral",
+    "phi3-vision", "fuyu", "cogvlm", "internvl2",
+}
+
+# ============================================================================
 # LOAD CONFIGURATION FROM YAML
 # ============================================================================
-def load_vision_config():
-    default_config = {
+def load_full_config() -> dict:
+    default_vision = {
         "enabled": True,
         "model": "qwen3-vl:235b-cloud",
+        "prefer_chat_model": True,
         "default_prompt": "What do you see in this image? Describe in detail.",
         "prompt_mode": "structured_json",
         "max_image_size_mb": 20,
         "resize_size": 1024,
     }
+
     try:
-        # Print debug info to stderr (visible in console when run standalone)
-        print(f"[DEBUG] Loading config from: {CONFIG_PATH}", file=sys.stderr)
+        report_to_console(f"Loading config from: {CONFIG_PATH}")
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        vision = data.get("vision", {})
-        config = {**default_config, **vision}
-        print(f"[DEBUG] Config loaded: model={config['model']}, mode={config['prompt_mode']}, resize={config['resize_size']}",
-              file=sys.stderr)
+
+        vision = {**default_vision, **data.get("vision", {})}
+
+        chat_mode = data.get("chat_mode", "ollama")
+        ollama_cfg = data.get("ollama", {})
+        llama_cfg = data.get("llama", {})
+
+        config = {
+            "vision": vision,
+            "chat_mode": chat_mode,
+            "ollama_base_url": ollama_cfg.get("base_url", "http://localhost:11434/v1"),
+            "ollama_chat_model": ollama_cfg.get("chat_model", "qwen2.5:7b"),
+            "ollama_api_key": ollama_cfg.get("api_key", "ollama"),
+            "llama_base_url": llama_cfg.get("base_url", "http://localhost:8088/v1"),
+            "llama_chat_model": llama_cfg.get("chat_model", ""),
+            "llama_api_key": llama_cfg.get("api_key", ""),
+        }
+
+        report_to_console(
+            f"Config: vision_model={vision['model']}, "
+            f"prefer_chat={vision['prefer_chat_model']}, "
+            f"chat_mode={chat_mode}"
+        )
         return config
+
     except Exception as e:
-        # Ensure logs directory exists before writing
         (REPO_ROOT / "logs").mkdir(parents=True, exist_ok=True)
-        with open(REPO_ROOT / "logs" / "mcp_vision.log", "a", encoding="utf-8") as logf:
-            logf.write(f"{datetime.now().isoformat()} Failed to load config: {e}, using defaults\n")
-        print(f"[WARN] Failed to load config: {e}, using defaults", file=sys.stderr)
-        return default_config
+        log_debug(f"Failed to load config: {e}, using defaults")
+        report_to_console(f"WARN: Failed to load config: {e}, using defaults")
+        return {
+            "vision": default_vision,
+            "chat_mode": "ollama",
+            "ollama_base_url": "http://localhost:11434/v1",
+            "ollama_chat_model": "qwen2.5:7b",
+            "ollama_api_key": "ollama",
+            "llama_base_url": "http://localhost:8088/v1",
+            "llama_chat_model": "",
+            "llama_api_key": "",
+        }
 
-config = load_vision_config()
 
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-VISION_MODEL = config["model"]
-PROMPT_MODE = config["prompt_mode"]
-DEFAULT_PROMPT = config["default_prompt"]
-MAX_IMAGE_SIZE_MB = config["max_image_size_mb"]
-RESIZE_SIZE = config["resize_size"]
+full_config = load_full_config()
 
-# Ensure logs directory exists
-DEBUG_LOG = REPO_ROOT / "logs" / "mcp_vision.log"
-DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+VISION_CFG = full_config["vision"]
+CHAT_MODE = full_config["chat_mode"]
+OLLAMA_BASE_URL = full_config["ollama_base_url"].replace("/v1", "")
+LLAMA_BASE_URL = full_config["llama_base_url"]
+
+VISION_MODEL = VISION_CFG["model"]
+PREFER_CHAT_MODEL = VISION_CFG["prefer_chat_model"]
+PROMPT_MODE = VISION_CFG["prompt_mode"]
+DEFAULT_PROMPT = VISION_CFG["default_prompt"]
+MAX_IMAGE_SIZE_MB = VISION_CFG["max_image_size_mb"]
+RESIZE_SIZE = VISION_CFG["resize_size"]
+
+# ============================================================================
+# VISION CAPABILITY DETECTION
+# ============================================================================
+
+def _strip_v1(url: str) -> str:
+    if url.endswith("/v1"):
+        return url[:-3]
+    return url
+
+
+def detect_ollama_vision(base_url: str, model_name: str) -> bool:
+    try:
+        url = _strip_v1(base_url) + "/api/show"
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(url, json={"name": model_name})
+            resp.raise_for_status()
+            data = resp.json()
+
+        details = data.get("details", {})
+        families = details.get("families", [])
+        family = details.get("family", "")
+
+        all_families = set(f.lower() for f in families)
+        if family:
+            all_families.add(family.lower())
+
+        for vf in VISION_FAMILIES:
+            if vf in all_families:
+                report_to_console(
+                    f"Ollama model '{model_name}' IS vision-capable "
+                    f"(matched family '{vf}', all families: {all_families})"
+                )
+                return True
+
+        model_info = data.get("model_info", {})
+        for key in model_info:
+            if "clip" in key.lower() or "vision" in key.lower() or "mmproj" in key.lower():
+                report_to_console(
+                    f"Ollama model '{model_name}' IS vision-capable "
+                    f"(matched model_info key '{key}')"
+                )
+                return True
+
+        report_to_console(
+            f"Ollama model '{model_name}' is NOT vision-capable "
+            f"(families: {all_families})"
+        )
+        return False
+
+    except Exception as e:
+        report_to_console(f"Ollama vision detection failed for '{model_name}': {e}")
+        return False
+
+
+def _find_modalities(obj) -> dict | None:
+    """Recursively search for the 'modalities' dict anywhere in the JSON tree."""
+    if isinstance(obj, dict):
+        if "modalities" in obj and isinstance(obj["modalities"], dict):
+            return obj["modalities"]
+        for v in obj.values():
+            result = _find_modalities(v)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_modalities(item)
+            if result is not None:
+                return result
+    return None
+
+
+def _find_keys_recursive(obj, target_keys: set) -> str | None:
+    """Recursively search for any of target_keys in the JSON tree. Returns the found key or None."""
+    if isinstance(obj, dict):
+        for k in obj:
+            if k in target_keys:
+                return k
+        for v in obj.values():
+            result = _find_keys_recursive(v, target_keys)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_keys_recursive(item, target_keys)
+            if result is not None:
+                return result
+    return None
+
+
+def detect_llama_vision(base_url: str) -> bool:
+    """
+    Detect vision capability of a llama.cpp server.
+
+    llama-server /props returns structured JSON with 'modalities' dict
+    somewhere in the tree, e.g.:
+        "modalities": {"vision": true, "audio": false}
+
+    The 'modalities' key may appear at any nesting level depending on
+    the llama.cpp build version, so we search recursively.
+    We check the exact boolean value of modalities.vision.
+    """
+    try:
+        props_url = _strip_v1(base_url) + "/props"
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(props_url)
+            if resp.status_code == 404:
+                # Older llama.cpp may not have /props — try /health
+                health_url = _strip_v1(base_url) + "/health"
+                resp = client.get(health_url)
+            resp.raise_for_status()
+
+            data = resp.json()
+
+        # Primary check: find 'modalities' dict anywhere in the tree
+        modalities = _find_modalities(data)
+        if isinstance(modalities, dict):
+            vision_flag = modalities.get("vision")
+            if isinstance(vision_flag, bool):
+                if vision_flag:
+                    report_to_console(
+                        "llama.cpp server IS vision-capable "
+                        f"(modalities.vision={vision_flag})"
+                    )
+                    return True
+                else:
+                    report_to_console(
+                        "llama.cpp server is NOT vision-capable "
+                        f"(modalities.vision={vision_flag})"
+                    )
+                    return False
+
+        # Fallback: check for mmproj / clip / projector metadata keys
+        # anywhere in the tree (some older builds expose these)
+        found_key = _find_keys_recursive(data, {"mmproj", "clip", "projector"})
+        if found_key:
+            report_to_console(
+                f"llama.cpp server IS vision-capable "
+                f"(found key '{found_key}' in /props)"
+            )
+            return True
+
+        report_to_console(
+            "llama.cpp server is NOT vision-capable "
+            "(no modalities.vision or projector metadata found)"
+        )
+        return False
+
+    except Exception as e:
+        report_to_console(f"llama.cpp vision detection failed: {e}")
+        return False
+
+
+def detect_vision_capability() -> dict | None:
+    if not PREFER_CHAT_MODEL:
+        report_to_console("prefer_chat_model is disabled, using dedicated vision model")
+        return None
+
+    if CHAT_MODE == "ollama":
+        model_name = full_config["ollama_chat_model"]
+        base_url = full_config["ollama_base_url"]
+        if model_name and detect_ollama_vision(base_url, model_name):
+            return {
+                "backend": "ollama",
+                "model": model_name,
+                "base_url": base_url,
+            }
+    elif CHAT_MODE == "llama":
+        model_name = full_config["llama_chat_model"]
+        base_url = full_config["llama_base_url"]
+        if model_name and detect_llama_vision(base_url):
+            return {
+                "backend": "llama",
+                "model": model_name,
+                "base_url": base_url,
+            }
+
+    report_to_console("Chat model does NOT support vision, falling back to dedicated vision model")
+    return None
+
+
+CHAT_VISION = detect_vision_capability()
+
+if CHAT_VISION:
+    ACTIVE_MODEL = CHAT_VISION["model"]
+    ACTIVE_BACKEND = CHAT_VISION["backend"]
+    ACTIVE_BASE_URL = CHAT_VISION["base_url"]
+    report_to_console(
+        f"ACTIVE: Using chat model '{ACTIVE_MODEL}' ({ACTIVE_BACKEND}) for vision"
+    )
+else:
+    ACTIVE_MODEL = VISION_MODEL
+    ACTIVE_BACKEND = "ollama"
+    ACTIVE_BASE_URL = OLLAMA_BASE_URL
+    report_to_console(
+        f"ACTIVE: Using dedicated vision model '{ACTIVE_MODEL}' (ollama fallback)"
+    )
 
 mcp = FastMCP("vision")
 
@@ -189,14 +452,6 @@ IMPORTANT:
 # ============================================================================
 # HELPERS
 # ============================================================================
-def log_debug(msg: str):
-    timestamp = datetime.now().isoformat()
-    with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(f"{timestamp} {msg}\n")
-
-def report_to_console(msg: str):
-    print(f"[MCP] vision: {msg}", file=sys.stderr, flush=True)
-    log_debug(msg)
 
 def normalize_image_to_png_base64(image_data: bytes) -> str:
     img = Image.open(io.BytesIO(image_data))
@@ -239,10 +494,15 @@ def load_local_image_data(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
 
-async def call_ollama_vl(prompt: str, image_base64: str) -> str:
-    async with httpx.AsyncClient(timeout=120) as client:
+# ============================================================================
+# VL CALL DISPATCHERS
+# ============================================================================
+
+async def call_ollama_vl(model: str, base_url: str, prompt: str, image_base64: str) -> str:
+    api_url = _strip_v1(base_url) + "/api/generate"
+    async with httpx.AsyncClient(timeout=180) as client:
         payload = {
-            "model": VISION_MODEL,
+            "model": model,
             "prompt": prompt,
             "images": [image_base64],
             "stream": False,
@@ -251,10 +511,57 @@ async def call_ollama_vl(prompt: str, image_base64: str) -> str:
                 "top_p": 0.9,
             }
         }
-        response = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        response = await client.post(api_url, json=payload)
         response.raise_for_status()
         data = response.json()
         return data.get("response", "").strip()
+
+
+async def call_openai_vl(model: str, base_url: str, prompt: str, image_base64: str, api_key: str = "") -> str:
+    api_url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(api_url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "").strip()
+        return ""
+
+
+async def call_vision_model(model: str, backend: str, base_url: str, prompt: str, image_base64: str) -> str:
+    if backend == "ollama":
+        return await call_ollama_vl(model, base_url, prompt, image_base64)
+    else:
+        api_key = ""
+        if backend == "llama":
+            api_key = full_config.get("llama_api_key", "")
+        return await call_openai_vl(model, base_url, prompt, image_base64, api_key)
 
 # ============================================================================
 # MCP TOOL
@@ -265,7 +572,10 @@ async def describe_image(
     prompt: str = DEFAULT_PROMPT,
     is_url: bool = False
 ) -> str:
-    report_to_console(f"describe_image called: source={image_source[:100]}, is_url={is_url}, mode={PROMPT_MODE}")
+    report_to_console(
+        f"describe_image called: source={image_source[:100]}, is_url={is_url}, "
+        f"mode={PROMPT_MODE}, active_model={ACTIVE_MODEL} ({ACTIVE_BACKEND})"
+    )
     try:
         if is_url:
             report_to_console(f"Downloading from URL: {image_source[:80]}")
@@ -284,10 +594,26 @@ async def describe_image(
             final_prompt = prompt
             report_to_console(f"Using free_text prompt: {prompt[:80]}...")
 
-        report_to_console(f"Sending to VL model: {VISION_MODEL}")
-        description = await call_ollama_vl(final_prompt, img_b64)
+        report_to_console(f"Sending to model: {ACTIVE_MODEL} (backend: {ACTIVE_BACKEND})")
 
-        report_to_console(f"Success: received {len(description)} chars from VL model")
+        try:
+            description = await call_vision_model(
+                ACTIVE_MODEL, ACTIVE_BACKEND, ACTIVE_BASE_URL,
+                final_prompt, img_b64
+            )
+        except Exception as primary_err:
+            if CHAT_VISION is not None:
+                report_to_console(
+                    f"Chat model '{ACTIVE_MODEL}' failed ({primary_err}), "
+                    f"falling back to dedicated vision model '{VISION_MODEL}'"
+                )
+                description = await call_ollama_vl(
+                    VISION_MODEL, OLLAMA_BASE_URL, final_prompt, img_b64
+                )
+            else:
+                raise
+
+        report_to_console(f"Success: received {len(description)} chars from model")
         return description
 
     except Exception as e:
@@ -299,11 +625,13 @@ async def describe_image(
 # MAIN ENTRY POINT (for standalone testing)
 # ============================================================================
 if __name__ == "__main__":
-    # Print startup information to stderr
     print(f"[MCP] vision: Starting MCP server (tool_vision.py)", file=sys.stderr)
     print(f"[MCP] vision: REPO_ROOT = {REPO_ROOT}", file=sys.stderr)
     print(f"[MCP] vision: Config path = {CONFIG_PATH}", file=sys.stderr)
-    print(f"[MCP] vision: Vision model = {VISION_MODEL}", file=sys.stderr)
+    print(f"[MCP] vision: Chat mode = {CHAT_MODE}", file=sys.stderr)
+    print(f"[MCP] vision: Dedicated vision model = {VISION_MODEL}", file=sys.stderr)
+    print(f"[MCP] vision: Prefer chat model = {PREFER_CHAT_MODEL}", file=sys.stderr)
+    print(f"[MCP] vision: Active model = {ACTIVE_MODEL} (backend: {ACTIVE_BACKEND})", file=sys.stderr)
     print(f"[MCP] vision: Prompt mode = {PROMPT_MODE}", file=sys.stderr)
     print(f"[MCP] vision: Resize size = {RESIZE_SIZE}px", file=sys.stderr)
     print(f"[MCP] vision: Max image size = {MAX_IMAGE_SIZE_MB}MB", file=sys.stderr)

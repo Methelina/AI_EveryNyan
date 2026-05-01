@@ -28,4 +28,13 @@ logging:
   level: "INFO"
   file: "logs/app.log"
 
+vision:
+  enabled: true
+  model: "qwen3-vl:235b-cloud"
+  prefer_chat_model: true
+  default_prompt: "What do you see in this image? Describe in detail."
+  prompt_mode: "structured_json"
+  max_image_size_mb: 20
+  resize_size: 1024
+
 debug: false

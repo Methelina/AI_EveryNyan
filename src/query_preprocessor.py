@@ -3,7 +3,7 @@
 Query Preprocessor for AI_EveryNyan.
 Provides lemmatization for indexing (RAG) and optional stopword removal.
 
-\src\query_preprocessor.py
+/src/query_preprocessor.py
 Version:     0.2.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
@@ -16,7 +16,7 @@ Patch Notes v0.2.0:
 v0.1.0: Initial implementation with lemmatization and stopword removal.
 """
 
-import logging
+from logger import logger
 import re
 from typing import Optional, Callable, Tuple, List
 
@@ -27,7 +27,7 @@ except ImportError:
     SPACY_AVAILABLE = False
     spacy = None
 
-logger = logging.getLogger("AI_EveryNyan.QueryPreprocessor")
+logger = logger.getChild("QueryPreprocessor")
 
 
 class QueryPreprocessor:

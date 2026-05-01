@@ -3,7 +3,7 @@ Exception logging utility for debugging unhandled errors.
 Enabled by calling install_excepthook() (typically when AppSettings.debug is True).
 Logs full tracebacks with frame locals to logs/debug_exceptions.log.
 
-src\logging_exceptions.py
+/src/logging_exceptions.py
 Version:     0.2.0
 Author:      pytraveler
 Updated:     2026-04-24
