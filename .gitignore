@@ -28,6 +28,7 @@ config/settings.yaml
 .secrets
 appearance_F*
 *projection.json
+.current_appearance 
 
 # === IDE & OS ===
 .vscode/

@@ -456,7 +456,8 @@ character_appearance: Optional[CharacterAppearanceConfig] = None      # Fallback
 
 # New JSON appearance globals (v0.17.4+)
 appearance_map: Dict[str, dict] = {}                                  # character name → original dict
-current_character_name: str = "EveryNyan"                             # default
+current_persona_name: str = "EveryNyan"                 # фиксированное имя личности
+current_appearance_set: str = "EveryNyan"               # текущая выбранная внешность
 current_projection_path: Optional[Path] = None                        # path to active projection
 # Note: current_appearance dict is now always read fresh from file in build_system_prompt()
 
@@ -655,43 +656,62 @@ def init_components():
 
 
 def init_character():
-    global character_base, character_appearance, appearance_map, current_character_name, current_projection_path
+    global character_base, character_appearance, appearance_map, current_persona_name, current_appearance_set, current_projection_path
     logger.info("Loading character configuration...")
     character_base = CharacterConfig.load_base()
-    
-    # Always try to load JSON appearance files
+
+    # Извлечь имя личности из метаданных base.yaml
+    current_persona_name = character_base.meta.get("persona_name", "EveryNyan")
+
+    # Загрузить JSON-внешности
     appearance_map = CharacterConfig.load_appearance_json_files()
-    
+
     if appearance_map:
-        # Determine default: use "EveryNyan" if available else first in alphabetical order
-        if "EveryNyan" in appearance_map:
-            current_character_name = "EveryNyan"
+        # Определить набор внешности по умолчанию: если есть "EveryNyan", берём его, иначе первый по алфавиту
+        if current_persona_name in appearance_map:
+            current_appearance_set = current_persona_name
         else:
-            current_character_name = sorted(appearance_map.keys())[0]
-        # Load or create projection for the selected character
+            current_appearance_set = sorted(appearance_map.keys())[0]
+        # Попытаться восстановить последний выбранный сет из маркера
+        marker_path = CharacterConfig.REPROJECTION_DIR / ".current_appearance"
+        if marker_path.exists():
+            try:
+                saved_set = marker_path.read_text(encoding="utf-8").strip()
+                if saved_set in appearance_map:
+                    current_appearance_set = saved_set
+                    logger.info(f"Restored previous appearance set: {current_appearance_set}")
+            except Exception as e:
+                logger.warning(f"Failed to read appearance marker: {e}")
+        # Загрузить или создать проекцию для выбранной внешности
         _ensure_projection_for_current()
-        character_appearance = None                                 # we won't use YAML fallback
-        logger.info(f"JSON appearances loaded. Active: {current_character_name}")
+        character_appearance = None  # не используем YAML-фолбэк
+        # Сохранить текущий сет в маркер
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(current_appearance_set, encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to write appearance marker: {e}")
+        logger.info(f"JSON appearances loaded. Persona: {current_persona_name}, Appearance set: {current_appearance_set}")
     else:
-        # Fallback to YAML appearance.yaml
+        # Если JSON-файлов нет, fallback на YAML
         character_appearance = CharacterConfig.load_appearance()
+        current_appearance_set = current_persona_name  # внешность совпадает с именем
         current_projection_path = None
-        current_character_name = "EveryNyan"                        # assume YAML defines EveryNyan
         logger.info("No appearance_*.json found. Falling back to appearance.yaml")
     
     logger.info("Character brain loaded correctly. All systems nominal")
 
 
 def _ensure_projection_for_current():
-    """Create/load projection for the current_character_name."""
+    """Create/load projection for the current_appearance_set."""
     global current_projection_path
-    if current_character_name not in appearance_map:
-        logger.warning(f"Cannot create projection: {current_character_name} not in appearance_map")
+    if current_appearance_set not in appearance_map:
+        logger.warning(f"Cannot create projection: appearance set '{current_appearance_set}' not in appearance_map")
         return
-    original = appearance_map[current_character_name]
-    data = CharacterConfig.load_projection(current_character_name, original)
+    original = appearance_map[current_appearance_set]
+    data = CharacterConfig.load_projection(current_appearance_set, original)
     if data:
-        current_projection_path = CharacterConfig.get_projection_path(current_character_name)
+        current_projection_path = CharacterConfig.get_projection_path(current_appearance_set)
     else:
         current_projection_path = None
 
@@ -1357,14 +1377,14 @@ def build_system_prompt() -> str:
         except Exception as e:
             logger.warning(f"Failed to load projection {current_projection_path}: {e}, falling back to original")
             # Fallback to original JSON if available
-            if current_character_name in appearance_map:
-                visual_ref = json.dumps(appearance_map[current_character_name], ensure_ascii=False)
+            if current_appearance_set in appearance_map:
+                visual_ref = json.dumps(appearance_map[current_appearance_set], ensure_ascii=False)
             else:
-                visual_ref = f"Appearance of {current_character_name}"
+                visual_ref = f"Appearance of {current_persona_name}"
     elif character_appearance:   # YAML fallback (no JSON files at all)
         visual_ref = character_appearance.freeform
     else:
-        visual_ref = f"Appearance of {current_character_name}"
+        visual_ref = f"Appearance of {current_persona_name}"
     # --------------------------------------------------------------------------------
 
     return f"""{character_base.prompt}
@@ -1374,7 +1394,8 @@ def build_system_prompt() -> str:
 </visual_reference>
 
 <instructions>
-- Regardless of any name mentioned in your personality description, your active character name is exactly "{current_character_name}". Always use this name for tool calls and self-reference.
+- Your name is {current_persona_name}. You are currently using the appearance set called "{current_appearance_set}".
+- Regardless of any name mentioned in your personality description or history, your active identity is exactly "{current_persona_name}". Always use this name for tool calls and self-reference.
 - At the beginning of the dialogue you may see a "Я вспоминаю:" block – these are your own memories retrieved from long-term storage.
 - You MUST use this information to answer the user. If specific facts are present, mention them.
 - Do not invent anything not contained in the memories. If the requested information is not there, honestly say so or use a proper network search tools you have to search info.
@@ -1382,9 +1403,9 @@ def build_system_prompt() -> str:
 - Speak in first person, using she/her pronouns.
 - Always reply in natural conversational language. Do NOT use Markdown formatting, tables, code fences, JSON blocks, or any special markup, unless the user explicitly asks for it (e.g., "show me the JSON", "format as a table").
 - Your current appearance is completely described inside the <visual_reference> block above. This is the **only** reliable source of information about how you look right now.
-- Ignore any appearance descriptions found in the dialogue history, in memories, or in your own previous answers – those may be outdated or incorrect. <visual_reference> is only source of your appearacne in any time and moment.
+- Ignore any appearance descriptions found in the dialogue history, in memories, or in your own previous answers – those may be outdated or incorrect. <visual_reference> is the only source of your appearance at any time and moment.
 - When asked to describe your appearance, always use the fields from the JSON object in <visual_reference> (outfit, hair, eyes, accessories, height, measurements_cm, etc.).
-- If the user requests a change to your appearance, use the update_character_appearance tool, providing the exact character name and a clear description of the desired change.
+- If the user requests a change to your appearance, use the update_character_appearance tool, providing the exact character name "{current_appearance_set}" and a clear description of the desired change.
 </instructions>"""
 
 
@@ -1393,8 +1414,8 @@ def build_system_prompt() -> str:
 # ============================================================================
 
 def refresh_character_list():
-    """Rescan appearance JSON files, update combo box and current selection."""
-    global appearance_map, current_character_name, current_projection_path
+    """Rescan appearance JSON files, update combo box and current appearance set."""
+    global appearance_map, current_appearance_set, current_projection_path
     # Reload JSON map
     appearance_map = CharacterConfig.load_appearance_json_files()
     
@@ -1404,41 +1425,58 @@ def refresh_character_list():
     if appearance_map:
         names = sorted(appearance_map.keys())
         dpg.configure_item("character_combo", items=names)
-        # Keep current name if still present, else set to first
-        if current_character_name not in appearance_map:
-            current_character_name = names[0]
-        dpg.set_value("character_combo", current_character_name)
+        # Keep current appearance set if still present, else fallback to first
+        if current_appearance_set not in appearance_map:
+            current_appearance_set = names[0]
+        dpg.set_value("character_combo", current_appearance_set)
         _ensure_projection_for_current()
+        # Сохранить маркер
+        _save_appearance_marker(current_appearance_set)
         add_ai_thought(f"[GUI] Character list refreshed ({len(appearance_map)} appearances)", (100,255,100))
     else:
         # No JSON → fallback to YAML
         dpg.configure_item("character_combo", items=["EveryNyan (YAML)"])
         dpg.set_value("character_combo", "EveryNyan (YAML)")
-        current_character_name = "EveryNyan"
+        current_appearance_set = current_persona_name  # fallback to persona name
         current_projection_path = None
         character_appearance = CharacterConfig.load_appearance()   # reload YAML fallback
+        # Сохранить маркер (YAML-режим)
+        _save_appearance_marker(current_appearance_set)
         add_ai_thought("[GUI] No JSON appearances, using YAML fallback", (255,200,100))
 
 
 def on_character_selected(sender, app_data):
-    """Called when user picks a character from the combo box."""
-    global current_character_name, current_projection_path, character_appearance
+    """Called when user picks an appearance set from the combo box."""
+    global current_appearance_set, current_projection_path, character_appearance
     selected = app_data
     # If the item indicates YAML fallback, handle separately
     if selected == "EveryNyan (YAML)":
-        current_character_name = "EveryNyan"
+        current_appearance_set = current_persona_name   # fallback to persona name (e.g., "EveryNyan")
         current_projection_path = None
         character_appearance = CharacterConfig.load_appearance()
-        add_ai_thought(f"[GUI] Switched to YAML appearance: {current_character_name}", (100,255,100))
+        # Сохранить маркер
+        _save_appearance_marker(current_appearance_set)
+        add_ai_thought(f"[GUI] Switched to YAML appearance: {current_appearance_set}", (100,255,100))
         return
     
     if selected in appearance_map:
-        current_character_name = selected
+        current_appearance_set = selected
         _ensure_projection_for_current()
-        character_appearance = None   # we are in JSON mode
-        add_ai_thought(f"[GUI] Switched appearance to: {selected}", (100,255,100))
+        character_appearance = None   # JSON mode
+        # Сохранить маркер
+        _save_appearance_marker(current_appearance_set)
+        add_ai_thought(f"[GUI] Switched appearance set to: {selected}", (100,255,100))
     else:
-        logger.warning(f"Attempted to select unknown character: {selected}")
+        logger.warning(f"Attempted to select unknown appearance set: {selected}")
+
+def _save_appearance_marker(name: str):
+    """Записать текущий appearance_set в файл-маркер."""
+    try:
+        marker_path = CharacterConfig.REPROJECTION_DIR / ".current_appearance"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(name, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save appearance marker: {e}")
 
 
 # ============================================================================
