@@ -3,7 +3,7 @@ Memory Manager for AI_EveryNyan.
 Uses DuckDB for structured chat history and Qdrant for semantic RAG memory.
 Provides Sliding Window mechanism and smart context dumping.
 
-\src\memory_manager.py
+/src/memory_manager.py
 Version:     0.7.0
 Author:      Soror L.'.L.'.
 Updated:     2026-04-21
@@ -17,7 +17,7 @@ Changes:
 
 import duckdb
 import json
-import logging
+from logger import logger
 import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
@@ -25,7 +25,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, validator, ValidationError
 
-logger = logging.getLogger("AI_EveryNyan.MemoryManager")
+logger = logger.getChild("MemoryManager")
 
 
 # ============================================================================
