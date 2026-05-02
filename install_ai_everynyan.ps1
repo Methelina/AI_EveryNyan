@@ -7,25 +7,24 @@
     Идемпотентен: безопасен для повторного запуска.
 
     \install_ai_everynyan.ps1
-    Version: 0.7.1
+    Version: 0.8.1
     Author: Soror L.'.L.'.
-    Updated: 2026-04-23
+    Updated: 2026-05-02
 #>
 
-# Patchnote v0.7.1:
-#   - Удалено создание скриптов запуска (run_ai_everynyan.bat и .example) – пользователь сам настраивает.
-#   + Добавлена проверка наличия Chromium в playwright_browsers после установки.
-#   * Улучшена справка по переменной PLAYWRIGHT_BROWSERS_PATH для существующего bat-файла.
+# Patchnote v0.8.1:
+#   [+] Добавлен флаг --no-warn-script-location для pip install (убирает ложные warning)
+#   [*] Исправлен вывод версии Python (убраны лишние переносы строки от conda)
+#   [*] Улучшена обработка stdout/stderr при проверке версии Python
 
-# Patchnote v0.7.0:
-#   + Добавлена изолированная установка Playwright Chromium в папку проекта
-#       (через PLAYWRIGHT_BROWSERS_PATH).
-#   * Обновлен список проверки импортов: добавлены playwright и nodriver.
-
-# Patchnote v0.6.0:
-#   + Добавлены проверки импортов для всех новых зависимостей из requirements.txt
-#       (aiohttp, httpx, duckdb, langchain*, openai, fastmcp, markdownify, langgraph и др.)
-
+# Patchnote v0.8.0:
+#   [*] Python 3.11 -> 3.12
+#   [*] spacy>=3.7.0 -> >=3.8.0 (требование для Python 3.12 wheels)
+#   [*] Обновлён список проверки импортов: nodriver помечен как опциональный
+#   [*] Улучшена обработка ошибок при установке spaCy-моделей
+#   [*] Добавлена проверка версии Python в созданном окружении
+#   [*] Улучшена логика проверки наличия Chromium в playwright_browsers
+#   [+] Добавлена проверка совместимости версий spaCy и Python
 
 # ==========================================
 Write-Host " ===========================================" -ForegroundColor Green
@@ -42,7 +41,8 @@ Write-Host "     ░  ░  ░    ░      ░  ░  ░    ░" -ForegroundColo
 Write-Host ""
 Write-Host "  ===========================================" -ForegroundColor Green
 Write-Host "    EveryNyan AI by L.'.L.'." -ForegroundColor Yellow
-Write-Host "    AI_EveryNyan Installer v0.7.1" -ForegroundColor Green
+Write-Host "    AI_EveryNyan Installer v0.8.1" -ForegroundColor Green
+Write-Host "    Python 3.12 Ready" -ForegroundColor Cyan
 Write-Host ""
 # ==========================================
 
@@ -52,7 +52,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 # === Конфигурация путей ===
 $ProjectRoot = $PSScriptRoot
-$PythonVersion = "3.11"
+$PythonVersion = "3.12"
 $EnvPath = Join-Path $ProjectRoot "env"
 $PythonExe = Join-Path $EnvPath "python.exe"
 $ConfigPath = Join-Path $ProjectRoot "config"
@@ -72,6 +72,7 @@ function Write-Status {
         "ERROR"   { "Red" }
         "WARN"    { "Yellow" }
         "SUCCESS" { "Green" }
+        "CYAN"    { "Cyan" }
         default   { "White" }
     }
     Write-Host "[$Level] $Message" -ForegroundColor $color
@@ -100,11 +101,19 @@ function Invoke-WithRetry {
     return $false
 }
 
+function Get-PythonVersion {
+    param([string]$PyExe)
+    try {
+        $ver = & $PyExe --version 2>$null
+        return ($ver -replace "`r|`n", "").Trim()
+    } catch { return $null }
+}
+
 function New-SettingsExample {
     param([string]$OutPath)
     $Content = @"
 # AI_EveryNyan Configuration
-# Version: 0.13.0
+# Version: 0.14.0
 # \config\settings.yaml
 
 # Выбор активного LLM-бэкенда для чата: "ollama" или "llama"
@@ -227,7 +236,8 @@ debug: false
 # === Основной процесс ===
 
 Write-Status "╔════════════════════════════════════════╗" "INFO"
-Write-Status "║  AI_EveryNyan Installer v0.7.1         ║" "INFO"
+Write-Status "║  AI_EveryNyan Installer v0.8.1         ║" "INFO"
+Write-Status "║  Python 3.12 Edition                   ║" "INFO"
 Write-Status "╚════════════════════════════════════════╝" "INFO"
 
 # 1. Проверка зависимостей
@@ -298,12 +308,12 @@ if ($modelInstalled) {
 }
 
 # 5. Conda-окружение + pip install
-Write-Status "`n[5/8] Настройка Python-окружения..." "INFO"
+Write-Status "`n[5/8] Настройка Python-окружения ($PythonVersion)..." "INFO"
 
 if (!(Test-Path $EnvPath)) {
     Write-Status "  Создание Conda env: $EnvPath" "INFO"
     $createOk = Invoke-WithRetry {
-        conda create --prefix $EnvPath python=$PythonVersion pip -y -q
+        conda create --prefix $EnvPath python=$PythonVersion pip -y -q 2>$null
         if ($LASTEXITCODE -ne 0) { throw "conda create failed" }
     }
     if (!$createOk) {
@@ -312,11 +322,21 @@ if (!(Test-Path $EnvPath)) {
     }
 }
 
+# Проверка версии Python в окружении
+$actualVer = Get-PythonVersion -PyExe $PythonExe
+Write-Status "  Python в окружении: $actualVer" "CYAN"
+
+if ($actualVer -notmatch "3\.12") {
+    Write-Status "  [!] ВНИМАНИЕ: Ожидалась версия 3.12, но найдена: $actualVer" "WARN"
+    Write-Status "  [!] Возможно, окружение было создано ранее с другой версией." "WARN"
+    Write-Status "  [!] Рекомендация: удалите папку '$EnvPath' и перезапустите установщик." "WARN"
+}
+
 # Установка зависимостей из requirements.txt
 if (Test-Path $ReqFile) {
     Write-Status "  Установка requirements..." "INFO"
     $pipOk = Invoke-WithRetry {
-        & $PythonExe -m pip install -r $ReqFile
+        & $PythonExe -m pip install -r $ReqFile --no-warn-script-location
         if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
     }
     if ($pipOk) { Write-Status "  [+] Зависимости установлены" "SUCCESS" }
@@ -329,7 +349,7 @@ if (Test-Path $ReqFile) {
 Write-Status "`n[5b/8] Установка Playwright и Chromium в проект..." "INFO"
 
 # Убедимся, что playwright установлен
-& $PythonExe -m pip install playwright>=1.40.0
+& $PythonExe -m pip install playwright>=1.40.0 --no-warn-script-location
 if ($LASTEXITCODE -ne 0) {
     Write-Status "  [!] Не удалось установить playwright" "WARN"
 } else {
@@ -355,17 +375,18 @@ if ($LASTEXITCODE -ne 0) {
 Write-Status "`n[6/8] Установка spaCy и языковых моделей..." "INFO"
 
 # Проверка, установлен ли spaCy
-$spacyInstalled = & $PythonExe -c "import spacy" 2>$null
+$spacyInstalled = & $PythonExe -c "import spacy; print(spacy.__version__)" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Status "  Установка spaCy через pip..." "INFO"
-    & $PythonExe -m pip install spacy>=3.7.0
+    & $PythonExe -m pip install "spacy>=3.8.0" --no-warn-script-location
     if ($LASTEXITCODE -ne 0) {
         Write-Status "  [!] Не удалось установить spaCy" "WARN"
     } else {
-        Write-Status "  [+] spaCy установлен" "SUCCESS"
+        $spacyVer = & $PythonExe -c "import spacy; print(spacy.__version__)" 2>$null
+        Write-Status "  [+] spaCy $spacyVer установлен" "SUCCESS"
     }
 } else {
-    Write-Status "  [+] spaCy уже установлен" "SUCCESS"
+    Write-Status "  [+] spaCy уже установлен (версия: $spacyInstalled)" "SUCCESS"
 }
 
 # Функция проверки наличия модели spaCy
@@ -378,6 +399,8 @@ try:
     print('OK')
 except OSError:
     print('MISSING')
+except Exception as e:
+    print(f'ERROR: {e}')
 "@
     $result = & $PythonExe -c $checkScript
     return $result.Trim() -eq "OK"
@@ -391,7 +414,11 @@ if (Test-SpacyModel -ModelName $ruModel) {
     Write-Status "  Установка модели $ruModel (~40 MB)..." "INFO"
     & $PythonExe -m spacy download $ruModel
     if ($LASTEXITCODE -eq 0) {
-        Write-Status "  [+] Модель $ruModel установлена" "SUCCESS"
+        if (Test-SpacyModel -ModelName $ruModel) {
+            Write-Status "  [+] Модель $ruModel установлена и проверена" "SUCCESS"
+        } else {
+            Write-Status "  [!] Модель $ruModel скачана, но не загружается. Возможна несовместимость версий." "WARN"
+        }
     } else {
         Write-Status "  [!] Не удалось установить $ruModel" "WARN"
     }
@@ -405,13 +432,17 @@ if (Test-SpacyModel -ModelName $enModel) {
     Write-Status "  Установка модели $enModel (~12 MB)..." "INFO"
     & $PythonExe -m spacy download $enModel
     if ($LASTEXITCODE -eq 0) {
-        Write-Status "  [+] Модель $enModel установлена" "SUCCESS"
+        if (Test-SpacyModel -ModelName $enModel) {
+            Write-Status "  [+] Модель $enModel установлена и проверена" "SUCCESS"
+        } else {
+            Write-Status "  [!] Модель $enModel скачана, но не загружается. Возможна несовместимость версий." "WARN"
+        }
     } else {
         Write-Status "  [!] Не удалось установить $enModel" "WARN"
     }
 }
 
-# 7. Проверка критических импортов (включая playwright и nodriver)
+# 7. Проверка критических импортов
 Write-Status "`n[7/8] Проверка критических импортов..." "INFO"
 
 $Modules = @(
@@ -445,7 +476,7 @@ $Modules = @(
     "langgraph",
     # Browser automation
     "playwright.async_api",
-    "nodriver"      # опционально, но проверяем
+    "nodriver"      # опционально, проверяем отдельно
 )
 
 $AllOK = $true
@@ -482,6 +513,9 @@ if (Test-Path $PlaywrightBrowsersPath) {
     $chromiumDirs = Get-ChildItem -Path $PlaywrightBrowsersPath -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue
     if ($chromiumDirs) {
         Write-Status "  [+] Chromium установлен в: $PlaywrightBrowsersPath" "SUCCESS"
+        foreach ($dir in $chromiumDirs) {
+            Write-Status "      -> $($dir.Name)" "CYAN"
+        }
     } else {
         Write-Status "  [!] Папка playwright_browsers существует, но Chromium не найден. Возможно, установка не завершилась." "WARN"
     }
@@ -498,6 +532,7 @@ Write-Status "Это обеспечит использование изолир�
 Write-Status "" "INFO"
 Write-Status "╔════════════════════════════════════════╗" "SUCCESS"
 Write-Status "║   Установка завершена!                 ║" "SUCCESS"
+Write-Status "║   Python 3.12 Edition                  ║" "SUCCESS"
 Write-Status "╚════════════════════════════════════════╝" "SUCCESS"
 Write-Status "" "INFO"
 Write-Status "Следующие шаги:" "INFO"

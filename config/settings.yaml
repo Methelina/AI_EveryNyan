@@ -1,0 +1,133 @@
+# AI_EveryNyan Configuration
+# Version: 0.14.0
+# \config\settings.yaml
+#
+# Patch Notes v0.14.0 (Soror L.'.L.'):
+#   [+] Added vision section for multimodal image analysis (VL model).
+#   [*] vision.resize_size: controls max dimension for image sanitization (PNG conversion + downsizing).
+#   [*] vision.model: name of Ollama VL model (e.g., qwen3-vl:235b-cloud, llava:latest).
+#   [*] vision.default_prompt: fallback prompt when user doesn't provide one.
+#   [*] vision.max_image_size_mb: security limit for uploaded images.
+
+# Выбор активного LLM-бэкенда для чата: "ollama" или "llama"
+chat_mode: "ollama"   # режим для генерации ответов
+
+# Отдельная настройка для эмбеддингов (можно указать ollama или другой сервер)
+embedding_mode: "ollama"   # можно "ollama", "llama", или "custom"
+
+# Настройки для Ollama (используется как для чата, так и для эмбеддингов, если выбраны)
+ollama:
+  base_url: "http://127.0.0.1:11434/v1"
+  api_key: "ollama"
+  chat_model: "deepseek-v3.1:671b-cloud"
+  # "qcwind/qwen2.5-7B-instruct-Q4_K_M:latest"
+  # "deepseek-v3.1:671b-cloud"
+  # "minimax-m2:cloud"
+  embedding_model: "bge-m3:latest"
+  timeout: 1800
+  temperature: 0.7
+  max_tokens: 8192
+  token_dump_threshold: 20000
+
+# Настройки для внешнего LLaMA-сервера (только для чата, эмбеддинги не поддерживаются)
+llama:
+  base_url: "http://127.0.0.1:8180/v1"
+  api_key: ""
+  chat_model: "Falcon-H1R-7B-Q8_0.gguf"
+  timeout: 1800
+  temperature: 0.7
+  max_tokens: 16304
+  token_dump_threshold: 20000
+
+# Мультимодальное зрение (vision-language модели через Ollama)
+vision:
+  enabled: true
+  model: "qwen3-vl:235b-cloud"         # VL-модель, доступная в Ollama (cloud или локальная)
+  default_prompt: "What do you see in this image? Describe in detail."
+  max_image_size_mb: 20                # максимальный размер загружаемого изображения
+  resize_size: 1024                    # длинная сторона изображения после ресайза (пиксели) — убивает стеганографию и нормализует данные
+
+vector_db:
+  url: "http://localhost:6333"
+  collection: "everynyan_diary"
+  embedding_dim: 1024
+
+rag:
+  top_k: 10
+  similarity_threshold: 0.65
+  enable_metadata_filtering: false
+
+context:
+  max_history_messages: 20
+  warn_if_context_exceeds: 20
+
+diary:
+  storage_dir: "data/diary"
+  plagiarism_threshold: 0.97
+  injection_max_length: 5000
+  summary_prompt: |
+    You are updating your personal diary. Process the provided context and write a reflective entry.
+    Time window: last 24–48h. Focus on facts, emotions, relationships, and actionable insights.
+    
+    <rules>
+    1. ALWAYS separate distinct thoughts/events with markdown lines `---`.
+    2. Each section must be self-sufficient (50–300 words).
+    3. Follow the exact structure below for EVERY section.
+    4. Output ONLY the formatted text. No greetings, no explanations, no markdown outside the structure.
+    5. DO NOT invent facts. If uncertain, state it explicitly.
+    6. Use canonical names for entities (e.g., "Linda" instead of "that girl").
+    7. Keep retrieval cues short, keyword-rich, and searchable.
+    8. At the end of each section, include a JSON block with metadata as shown below.
+    </rules>
+
+    <output_format>
+    **Timestamp:** [Absolute time or time window]
+    **Source Event:** [What triggered this memory]
+    **Outcomes:** [Concrete results, decisions, or emotional shifts]
+
+    **Entities:** [Canonical names of people, places, systems]
+    **Key Messages:** 
+    - "[Verbatim quote 1]"
+    - "[Verbatim quote 2]" (include context if needed)
+
+    **Topics/Tags:** #[tag1] #[tag2] #[tag3]
+    **Importance Score:** [0.0–1.0] – [1-sentence rationale]
+    **Affect:** Valence [-1..1, where -1=depressed/misery, +1=ecstasy/elation], Arousal [-1..1, where -1=aversion/withdrawal, +1=intense approach/desire], plus a short emotion label.
+    **Relationships:** [How entities relate to each other or to you]
+
+    **Retrieval Cues:** ["search phrase 1", "search phrase 2", "search phrase 3"]
+    **Photo Descriptions:** [If applicable: detailed visual description + filename]
+    **Contradictions/Uncertainties:** [Conflicts, missing info, or things needing verification]
+
+    Then output a JSON object with the following fields (no extra text after JSON):
+    ```json
+    {
+      "entities": ["list", "of", "canonical", "names"],
+      "topics": ["#tag1", "#tag2"],
+      "retrieval_cues": ["phrase1", "phrase2"],
+      "key_facts": ["important quote or fact"],
+      "affect_valence": 0.0,
+      "affect_arousal": 0.0,
+      "emotion_label": "short emotion description",
+      "importance_score": 0.0,
+      "relationships": {"A-B": "friend", "B-C": "colleague"},
+      "contradictions": ["any uncertainties"]
+    }
+    </output_format>
+
+anti_repeat:
+  trigger_avg: 0.73
+  trigger_max: 0.69
+  max_history: 32
+
+gui:
+  title: "AI_EveryNyan"
+  width: 900
+  height: 700
+  theme: "dark"
+
+logging:
+  level: "INFO"
+  file: "logs/app.log"
+
+debug: false
