@@ -28,7 +28,7 @@ dearpygui>=1.11.0
 structlog>=24.0.0
 PyYAML>=6.0.1
 tqdm>=4.66.0
-spacy>=3.7.0
+spacy>=3.8.0              # >=3.8.0 required for Python 3.12 pre-built wheels
 websocket-client
 
 # === MCP Server (SearXNG) ===
@@ -50,6 +50,8 @@ langgraph>=0.4.0
 Pillow>=10.0.0              # image validation, sanitization, resizing, PNG conversion
 # opencv-python>=4.8.0     # not yet required; would be needed for video frame extraction
 
-# Patch Notes v0.14.0 (Soror L.'.L.'):
+# Patch Notes v0.15.0 (Soror L.'.L.'):
+#   [*] Python 3.11 -> 3.12 migration
+#   [*] spacy>=3.7.0 -> >=3.8.0 (Python 3.12 wheel compatibility)
+#   [*] Updated installer to v0.8.0 with Python version verification
 #   [+] Added Pillow for multimodal vision tool (describe_image).
-#   [*] No other changes – existing libraries cover all features.
