@@ -22,7 +22,7 @@ hf_cache/
 temp/
 
 # === Configs & Secrets ===
-# config/settings.yaml
+config/settings
 .env
 .env.local
 .secrets
