@@ -3,9 +3,23 @@ DearPyGui GUI setup, control panel callbacks, AI thoughts display, and splitter 
 Handles viewport, theming, chat rendering, model selection, and runtime parameter controls.
 
 /src/gui.py
-Version:     0.17.6
+Version:     0.17.7
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-05-03
+
+Patch Notes v0.17.7 (by pytraveler):
+  [+] Image thumbnails in chat: add_chat_message() now parses message text for image
+      file paths (lines that are existing files ending in .png/.jpg/.webp/.bmp/.gif),
+      strips them from the displayed text, and renders them as clickable thumbnails
+      (max 280 px, aspect-ratio preserved) below the message body.
+  [+] Modal image viewer: clicking a thumbnail opens a popup with the full-size image
+      scaled to 80 % of the viewport, plus a Close button. Image and Close button
+      resize dynamically when the modal window is resized (item_resize_handler).
+  [+] Shared texture registry (chat_texture_registry) and image_button_theme created
+      in setup_gui() — frameless transparent buttons with subtle hover border.
+  [+] _parse_image_paths(), _add_image_thumbnail(), _open_image_modal() helpers.
+  [~] History loading in setup_gui() now calls add_chat_message() instead of building
+      widgets inline — so image thumbnails appear on reload too.
 
 Patch Notes v0.17.6 (by pytraveler):
   [+] Extracted from main.py: setup_gui(), all DPG widget construction.
@@ -34,6 +48,7 @@ from datetime import datetime
 from json import loads, dumps
 from pathlib import Path
 from typing import Optional, Tuple
+import uuid
 
 import dearpygui.dearpygui as dpg
 
@@ -237,15 +252,177 @@ def on_chat_area_resize():
 # Chat message display
 # ============================================================================
 
+_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
+_THUMB_MAX_SIZE = 280  # max thumbnail dimension in pixels
+
+
+def _parse_image_paths(text: str) -> Tuple[str, list]:
+    """Extract valid image file paths from message text.
+
+    Lines that consist solely of an existing file path ending in an image
+    extension are stripped from the text and collected separately.
+
+    Returns (cleaned_text, list_of_existing_image_paths).
+    """
+    lines = text.split('\n')
+    clean_lines: list[str] = []
+    image_paths: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and any(stripped.lower().endswith(ext) for ext in _IMAGE_EXTENSIONS):
+            if Path(stripped).is_file():
+                image_paths.append(stripped)
+                continue
+        clean_lines.append(line)
+    return '\n'.join(clean_lines), image_paths
+
+
+def _open_image_modal(sender, app_data, user_data):
+    """Open a modal popup showing the full-size image that resizes with the window."""
+    tex_tag = user_data["tex_tag"]
+    orig_w = user_data["orig_w"]
+    orig_h = user_data["orig_h"]
+    image_path = user_data["path"]
+
+    modal_tag = f"img_modal_{uuid.uuid4().hex[:8]}"
+    img_tag = f"{modal_tag}_img"
+    btn_tag = f"{modal_tag}_btn"
+    hr_tag = f"{modal_tag}_hr"
+
+    vp_w = dpg.get_viewport_width()
+    vp_h = dpg.get_viewport_height()
+    max_w = int(vp_w * 0.8)
+    max_h = int(vp_h * 0.8)
+
+    ratio_w = max_w / orig_w if orig_w > max_w else 1.0
+    ratio_h = max_h / orig_h if orig_h > max_h else 1.0
+    ratio = min(ratio_w, ratio_h)
+    display_w = int(orig_w * ratio)
+    display_h = int(orig_h * ratio)
+
+    def _on_modal_resize():
+        if not dpg.does_item_exist(modal_tag):
+            return
+        try:
+            win_size = dpg.get_item_rect_size(modal_tag)
+            avail_w = win_size[0] - 24
+            avail_h = win_size[1] - 84
+        except Exception:
+            return
+        if avail_w < 50 or avail_h < 50:
+            return
+        r = min(avail_w / orig_w, avail_h / orig_h)
+        new_w = max(int(orig_w * r), 50)
+        new_h = max(int(orig_h * r), 50)
+        try:
+            if dpg.does_item_exist(img_tag):
+                dpg.configure_item(img_tag, width=new_w, height=new_h)
+            if dpg.does_item_exist(btn_tag):
+                dpg.configure_item(btn_tag, width=new_w)
+        except Exception:
+            pass
+
+    def _close_modal():
+        if dpg.does_item_exist(hr_tag):
+            dpg.delete_item(hr_tag)
+        if dpg.does_item_exist(modal_tag):
+            dpg.delete_item(modal_tag)
+
+    with dpg.window(
+        tag=modal_tag,
+        modal=True,
+        popup=True,
+        label=Path(image_path).name,
+        no_resize=False,
+        width=display_w + 24,
+        height=display_h + 84,
+    ):
+        dpg.add_image(tex_tag, tag=img_tag, width=display_w, height=display_h)
+        dpg.add_spacer(height=5)
+        dpg.add_button(
+            label="Close",
+            tag=btn_tag,
+            width=display_w,
+            callback=lambda s, a: _close_modal(),
+        )
+
+    with dpg.item_handler_registry(tag=hr_tag):
+        dpg.add_item_resize_handler(callback=lambda s, a: _on_modal_resize())
+    dpg.bind_item_handler_registry(modal_tag, hr_tag)
+
+
+def _add_image_thumbnail(parent: str, image_path: str):
+    """Add a clickable image thumbnail to a parent widget."""
+    path = Path(image_path)
+    if not path.exists():
+        return
+
+    try:
+        width, height, channels, data = dpg.load_image(str(path))
+    except Exception as e:
+        logger.warning(f"[GUI] Failed to load thumbnail {image_path}: {e}")
+        return
+
+    tex_tag = f"img_tex_{uuid.uuid4().hex[:8]}"
+    try:
+        dpg.add_static_texture(
+            width, height, data,
+            tag=tex_tag,
+            parent="chat_texture_registry",
+        )
+    except Exception:
+        with dpg.texture_registry(show=False):
+            dpg.add_static_texture(width, height, data, tag=tex_tag)
+
+    # Scale to thumbnail size preserving aspect ratio
+    if max(width, height) > _THUMB_MAX_SIZE:
+        ratio = _THUMB_MAX_SIZE / max(width, height)
+        thumb_w = int(width * ratio)
+        thumb_h = int(height * ratio)
+    else:
+        thumb_w = width
+        thumb_h = height
+
+    btn_tag = f"img_btn_{uuid.uuid4().hex[:8]}"
+    dpg.add_image_button(
+        tex_tag,
+        tag=btn_tag,
+        width=thumb_w,
+        height=thumb_h,
+        callback=_open_image_modal,
+        user_data={
+            "tex_tag": tex_tag,
+            "orig_w": width,
+            "orig_h": height,
+            "path": image_path,
+        },
+        parent=parent,
+    )
+
+    if dpg.does_item_exist("image_button_theme"):
+        dpg.bind_item_theme(btn_tag, "image_button_theme")
+
+
 def add_chat_message(sender: str, text: str, color: tuple):
+    """Add a chat message to the chat area.
+
+    Automatically detects image file paths in the text and displays
+    them as clickable thumbnails below the text content.
+    """
     wrap_w = get_chat_wrap_width()
     dpg.set_y_scroll("chat_area", 1e9)
+
+    clean_text, image_paths = _parse_image_paths(text)
+
     with dpg.group(parent="chat_area", horizontal=False):
         with dpg.group(horizontal=True):
             dpg.add_text(f"{sender}:", color=color)
-        with dpg.group(indent=20):
-            tag = dpg.add_text(text, wrap=wrap_w)
-            _chat_text_tags.append(tag)
+        with dpg.group(indent=20) as msg_body:
+            if clean_text.strip():
+                tag = dpg.add_text(clean_text, wrap=wrap_w)
+                _chat_text_tags.append(tag)
+            for img_path in image_paths:
+                _add_image_thumbnail(parent=msg_body, image_path=img_path)
         dpg.add_spacer(height=5)
     dpg.set_y_scroll("chat_area", 1e9)
 
@@ -462,6 +639,7 @@ def on_memory_report():
 
 def setup_gui():
     dpg.create_context()
+    dpg.add_texture_registry(tag="chat_texture_registry", show=False)
     font_path = find_available_font()
     if font_path:
         with dpg.font_registry():
@@ -478,6 +656,17 @@ def setup_gui():
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (220,220,220))
         dpg.bind_theme(dark_theme)
 
+    # Image button theme — transparent background, subtle hover border
+    with dpg.theme(tag="image_button_theme"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (60, 60, 90, 100))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (80, 80, 120, 140))
+            dpg.add_theme_color(dpg.mvThemeCol_Border, (100, 100, 150, 80))
+            dpg.add_theme_color(dpg.mvThemeCol_BorderShadow, (0, 0, 0, 0))
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
+
     with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False, no_scrollbar=True):
         dpg.set_primary_window("main_window", True)
 
@@ -489,13 +678,7 @@ def setup_gui():
                         for msg in history:
                             color = (100,200,255) if msg['role'] == 'user' else (255,200,100)
                             sender = "You" if msg['role'] == 'user' else "AI_EveryNyan"
-                            with dpg.group(horizontal=False):
-                                with dpg.group(horizontal=True):
-                                    dpg.add_text(f"{sender}:", color=color)
-                                with dpg.group(indent=20):
-                                    tag = dpg.add_text(msg['content'], wrap=get_chat_wrap_width())
-                                    _chat_text_tags.append(tag)
-                                dpg.add_spacer(height=5)
+                            add_chat_message(sender, msg['content'], color)
                     else:
                         dpg.add_text("Welcome to AI_EveryNyan!", color=(150,150,200))
 

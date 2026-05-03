@@ -37,4 +37,11 @@ vision:
   max_image_size_mb: 20
   resize_size: 1024
 
+# ComfyUI image generation
+comfyui:
+  server: "127.0.0.1:8084"
+  workflow_dir: "workflows"
+  output_dir: "data/comfyui_output"
+  http_timeout: 120
+
 debug: false
