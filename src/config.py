@@ -89,6 +89,13 @@ class ContextSettings(BaseModel):
     warn_if_context_exceeds: int = 20
 
 
+class ComfyUISettings(BaseModel):
+    server: str = "127.0.0.1:8084"
+    workflow_dir: str = "workflows"
+    output_dir: str = "data/comfyui_output"
+    http_timeout: int = 120
+
+
 class AppSettings(BaseSettings):
     chat_mode: Literal["ollama", "llama"] = "ollama"
     embedding_mode: Literal["ollama", "custom"] = "ollama"
@@ -103,6 +110,7 @@ class AppSettings(BaseSettings):
     anti_repeat: AntiRepeatSettings = Field(default_factory=AntiRepeatSettings)
     rag: RAGSettings = Field(default_factory=RAGSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    comfyui: ComfyUISettings = Field(default_factory=ComfyUISettings)
     debug: bool = False
 
     model_config = ConfigDict(

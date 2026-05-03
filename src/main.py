@@ -4,9 +4,18 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 src/main.py
-Version:     0.17.6 (Modular refactoring)
+Version:     0.17.7 (Modular refactoring)
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-05-03
+
+Patch Notes v0.17.7 (by pytraveler):
+  [+] ComfyUI image path injection: _extract_image_paths() extracts file paths from
+      generate_image tool results and appends them to the LLM response text so that
+      gui.py add_chat_message() can parse them and render image thumbnails inline.
+  [+] Deduplication: only appends paths that are NOT already present in the LLM response,
+      so paths are never duplicated even if the model mentions them verbatim.
+  [~] Image paths become part of the response stored in DuckDB, so thumbnails appear
+      on history reload as long as the files still exist on disk.
 
 Patch Notes v0.17.6 (by pytraveler):
   [REFACTOR] Split monolithic main.py (2081 lines) into 6 focused modules:
@@ -81,6 +90,19 @@ from logger import logger
 # Message Processing (UNIFIED LOGIC — central orchestrator)
 # ============================================================================
 
+_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
+
+def _extract_image_paths(content: str) -> list[str]:
+    """Extract existing image file paths from tool result text."""
+    paths = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and any(stripped.lower().endswith(ext) for ext in _IMAGE_EXTENSIONS):
+            if Path(stripped).is_file():
+                paths.append(stripped)
+    return paths
+
 async def process_message(user_text: str) -> str:
     if check_anti_repetition_semantic(user_text):
         return "I feel like we're going in circles. Let's talk about something new!"
@@ -151,6 +173,7 @@ async def process_message(user_text: str) -> str:
                 finalize_ai_message_streaming()
                 return content
 
+            collected_image_paths: list[str] = []
             for msg in result["messages"]:
                 if hasattr(msg, 'tool_calls') and msg.tool_calls:
                     for tc in msg.tool_calls:
@@ -166,8 +189,14 @@ async def process_message(user_text: str) -> str:
                     logger.info(f"MCP TOOL RESULT ({tool_name}): {msg.content}")
                     if "error" in msg.content.lower() or "exception" in msg.content.lower():
                         add_ai_thought(f"[TOOL] Error in {tool_name}: {msg.content[:300]}", (255, 100, 100))
+                    if tool_name == "generate_image":
+                        collected_image_paths.extend(_extract_image_paths(msg.content))
 
             content = result["messages"][-1].content
+            if collected_image_paths:
+                missing = [p for p in collected_image_paths if p not in content]
+                if missing:
+                    content += "\n" + "\n".join(missing)
             final_msg = result["messages"][-1]
             reasoning = ""
             if hasattr(final_msg, "additional_kwargs"):
