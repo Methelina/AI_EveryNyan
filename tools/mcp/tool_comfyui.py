@@ -249,6 +249,7 @@ async def generate_image(
     node_overrides: str = "",
 ) -> str:
     """
+    This tool requested when user ask for photo, image generation, selfie or make an art. 
     Generate an image using ComfyUI by submitting a workflow with the given prompts.
     Returns the local file paths of the generated images.
 
