@@ -3,9 +3,15 @@ Application configuration models and character config loader for AI_EveryNyan.
 Pydantic-based settings with YAML override. Character YAML/JSON file loader.
 
 /src/config.py
-Version:     0.17.6
+Version:     0.17.7
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-05-05
+
+Patch Notes v0.17.7 (by pytraveler):
+  [+] WorkspaceSettings model: sandboxed file access config for LLM tools
+      (workspace_dir, max_file_size, max_read_lines, max_read_bytes, etc.).
+  [+] ComfyUISettings.daemon_check_interval: configurable reconnect interval.
+  [+] AppSettings.workspace: new field with WorkspaceSettings defaults.
 
 Patch Notes v0.17.6 (by pytraveler):
   [+] Extracted from main.py: AppSettings, all sub-settings models.
@@ -89,11 +95,22 @@ class ContextSettings(BaseModel):
     warn_if_context_exceeds: int = 20
 
 
+class WorkspaceSettings(BaseModel):
+    workspace_dir: str = "."
+    max_file_size: int = 10 * 1024 * 1024
+    max_read_lines: int = 2000
+    max_read_bytes: int = 1024 * 1024
+    max_search_results: int = 200
+    allow_hidden_files: bool = False
+    max_line_count_size: int = 1024 * 1024
+
+
 class ComfyUISettings(BaseModel):
     server: str = "127.0.0.1:8084"
     workflow_dir: str = "workflows"
     output_dir: str = "data/comfyui_output"
     http_timeout: int = 120
+    daemon_check_interval: float = 5.0
 
 
 class AppSettings(BaseSettings):
@@ -111,6 +128,7 @@ class AppSettings(BaseSettings):
     rag: RAGSettings = Field(default_factory=RAGSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     comfyui: ComfyUISettings = Field(default_factory=ComfyUISettings)
+    workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
     debug: bool = False
 
     model_config = ConfigDict(

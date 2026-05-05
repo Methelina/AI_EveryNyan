@@ -4,9 +4,13 @@ Holds all mutable global state (settings, LLM, vector store, etc.).
 Provides component initialization, embedding/LLM reinit, and MCP agent setup.
 
 /src/runtime.py
-Version:     0.17.6
+Version:     0.17.7
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-05-05
+
+Patch Notes v0.17.7 (by pytraveler):
+  [+] comfyui_daemon: global reference to ComfyUIDaemon instance.
+  [+] comfyui_generation_active: flag tracking active ComfyUI generation state.
 
 Patch Notes v0.17.6 (by pytraveler):
   [+] Extracted from main.py: all global state variables.
@@ -50,6 +54,8 @@ embeddings: Optional[OpenAIEmbeddings] = None
 memory_manager: Optional[MemoryManager] = None
 mcp_client = None
 react_agent = None
+comfyui_daemon = None
+comfyui_generation_active: bool = False 
 query_preprocessor: Optional[QueryPreprocessor] = None
 
 # ============================================================================

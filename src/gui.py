@@ -3,9 +3,17 @@ DearPyGui GUI setup, control panel callbacks, AI thoughts display, and splitter 
 Handles viewport, theming, chat rendering, model selection, and runtime parameter controls.
 
 /src/gui.py
-Version:     0.17.7
+Version:     0.17.8
 Author:      Soror L.'.L.'.
-Updated:     2026-05-03
+Updated:     2026-05-05
+
+Patch Notes v0.17.8 (by pytraveler):
+  [+] ComfyUI Monitor integration: real-time preview panel, progress bar, and
+      cancel button for image generation via ComfyUIDaemon state polling.
+  [+] Watchdog thread auto-restarts the frame callback if DearPyGui chain breaks.
+  [+] Debug generate button (debug mode only) to queue test ComfyUI workflows.
+  [+] Stall detection: auto-hides UI if progress freezes for 15+ seconds.
+  [+] Dynamic texture for live preview with make_square_preview / rgba_to_float_list.
 
 Patch Notes v0.17.7 (by pytraveler):
   [+] Image thumbnails in chat: add_chat_message() now parses message text for image
@@ -49,8 +57,12 @@ from json import loads, dumps
 from pathlib import Path
 from typing import Optional, Tuple
 import uuid
+import time
+import io
+import threading
 
 import dearpygui.dearpygui as dpg
+from PIL import Image
 
 import runtime
 from runtime import (
@@ -634,12 +646,367 @@ def on_memory_report():
 
 
 # ============================================================================
+# ComfyUI Monitor Integration
+# ============================================================================
+
+_comfyui_last_tick: float = 0.0
+_COMFYUI_PREVIEW_SIZE: int = 224
+_comfyui_visible: bool = False  # manual visibility tracking
+_comfyui_hide_after: float = 0.0  # timestamp when UI should auto-hide after generation ends
+_comfyui_debug_generating: bool = False  # guard against double-click on debug generate
+_comfyui_last_progress: tuple = (0, 0)  # (value, max) — track progress stalls
+_comfyui_stall_since: float = 0.0  # timestamp when progress first stalled
+_comfyui_force_hidden: bool = False  # set by stall detection to prevent immediate re-show
+_comfyui_prev_generating: bool = False  # tracks daemon generating state transitions
+_comfyui_suppress_logged: bool = False  # one-shot: log when UI suppressed during generation
+_comfyui_last_prompt_id: Optional[str] = None  # track daemon prompt_id for new-gen detection
+_comfyui_heartbeat: float = 0.0  # last heartbeat log timestamp
+_comfyui_tick_count: int = 0  # total monitor ticks (diagnostic)
+_comfyui_watchdog_stop: threading.Event = threading.Event()  # signal watchdog to stop
+
+
+def _comfyui_watchdog_thread():
+    """Background watchdog: restarts the monitor frame callback if it stalls.
+
+    DearPyGui's set_frame_callback chain can silently break (e.g., after showing
+    the preview panel with dynamic texture updates). This thread detects the stall
+    by checking _comfyui_last_tick and reschedules the callback.
+    """
+    while not _comfyui_watchdog_stop.is_set():
+        _comfyui_watchdog_stop.wait(3.0)
+        if _comfyui_watchdog_stop.is_set():
+            break
+        now = time.perf_counter()
+        stalled = now - _comfyui_last_tick
+        if stalled > 5.0 and _comfyui_last_tick > 0:
+            logger.warning(
+                f"[ComfyUI Monitor] Watchdog: callback stalled for {stalled:.1f}s, restarting"
+            )
+            try:
+                dpg.set_frame_callback(dpg.get_frame_count() + 1, _update_comfyui_monitor)
+            except Exception as e:
+                logger.error(f"[ComfyUI Monitor] Watchdog restart failed: {e}")
+
+
+def _on_comfyui_debug_generate(sender, app_data):
+    """Queue a test generation in ComfyUI directly (debug only).
+
+    Sends the default workflow with a simple test prompt so the user can
+    verify that the preview pipeline works without going through the LLM.
+    """
+    global _comfyui_debug_generating
+    if _comfyui_debug_generating:
+        add_ai_thought("[ComfyUI DEBUG] Generation already in progress", (255, 200, 100))
+        return
+
+    _comfyui_debug_generating = True
+    add_ai_thought("[ComfyUI DEBUG] Queuing test generation...", (255, 200, 100))
+
+    import json as _json
+    import urllib.request as _urllib_req
+
+    def _do_generate():
+        global _comfyui_debug_generating
+        try:
+            server = runtime.settings.comfyui.server
+            wf_path = Path(runtime.settings.comfyui.workflow_dir) / "default.json"
+            if not wf_path.exists():
+                add_ai_thought(f"[ComfyUI DEBUG] Workflow not found: {wf_path}", (255, 100, 100))
+                return
+
+            workflow = _json.loads(wf_path.read_text(encoding="utf-8"))
+
+            # Inject a simple test positive prompt
+            for nid, node in workflow.items():
+                if not isinstance(node, dict):
+                    continue
+                ct = node.get("class_type", "")
+                if ct == "CLIPTextEncode" and "text" in node.get("inputs", {}):
+                    title = node.get("_meta", {}).get("title", "").lower()
+                    is_pos = any(kw in title for kw in ("pos", "positive"))
+                    if is_pos or (ct == "CLIPTextEncode" and nid == min(
+                        k for k, v in workflow.items()
+                        if isinstance(v, dict) and v.get("class_type") == "CLIPTextEncode"
+                    )):
+                        node["inputs"]["text"] = "masterpiece, best quality, 1girl, simple background, smile, test image"
+                        break
+
+            payload = _json.dumps({
+                "prompt": workflow,
+                "client_id": "ai_everynyan",
+            }).encode("utf-8")
+
+            req = _urllib_req.Request(
+                f"http://{server}/prompt",
+                data=payload,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+
+            with _urllib_req.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+
+            prompt_id = result.get("prompt_id", "?")
+            add_ai_thought(
+                f"[ComfyUI DEBUG] Queued prompt_id={prompt_id} — watch preview panel",
+                (100, 255, 100),
+            )
+        except Exception as e:
+            add_ai_thought(f"[ComfyUI DEBUG] Failed: {e}", (255, 100, 100))
+        finally:
+            _comfyui_debug_generating = False
+
+    import threading
+    threading.Thread(target=_do_generate, daemon=True, name="ComfyUIDebugGen").start()
+
+
+def _on_comfyui_cancel(sender, app_data):
+    global _comfyui_visible, _comfyui_stall_since, _comfyui_last_progress, _comfyui_force_hidden
+    logger.info(
+        f"[ComfyUI Monitor] Cancel pressed: visible={_comfyui_visible}, "
+        f"force_hidden={_comfyui_force_hidden}, prev_gen={_comfyui_prev_generating}"
+    )
+    daemon = runtime.comfyui_daemon
+    if daemon:
+        daemon.cancel_and_free()
+        add_ai_thought("[ComfyUI] Generation cancelled, freeing GPU memory...", (255, 200, 100))
+    _comfyui_visible = False
+    _comfyui_stall_since = 0.0
+    _comfyui_last_progress = (0, 0)
+    _comfyui_force_hidden = False  # allow showing on next generation
+    _comfyui_last_prompt_id = None  # reset so next generation's prompt_id triggers detection
+    try:
+        dpg.configure_item("comfyui_preview_group", show=False)
+        dpg.configure_item("comfyui_progress_group", show=False)
+    except Exception:
+        pass
+
+
+def _update_comfyui_monitor():
+    global _comfyui_last_tick, _comfyui_visible, _comfyui_hide_after
+    global _comfyui_last_progress, _comfyui_stall_since
+    global _comfyui_force_hidden, _comfyui_prev_generating
+    global _comfyui_suppress_logged, _comfyui_last_prompt_id
+    global _comfyui_heartbeat, _comfyui_tick_count
+    try:
+        daemon = runtime.comfyui_daemon
+        if daemon is None:
+            return  # rescheduled in finally
+
+        now = time.perf_counter()
+        if now - _comfyui_last_tick < 0.15:
+            return
+        _comfyui_last_tick = now
+        _comfyui_tick_count += 1
+
+        state = daemon.get_state()
+
+        # Periodic heartbeat (every 30s) to confirm monitor is alive
+        if now - _comfyui_heartbeat > 30.0:
+            _comfyui_heartbeat = now
+            logger.info(
+                f"[ComfyUI Monitor] heartbeat #{_comfyui_tick_count}: "
+                f"generating={state['generating']}, visible={_comfyui_visible}, "
+                f"force_hidden={_comfyui_force_hidden}, prev_gen={_comfyui_prev_generating}, "
+                f"prompt_id={state.get('prompt_id')}, connected={state['connected']}"
+            )
+
+        # Connection status indicator
+        conn_label = "ComfyUI: Connected" if state["connected"] else "ComfyUI: Disconnected"
+        conn_color = (100, 255, 100) if state["connected"] else (200, 100, 100)
+        try:
+            if dpg.does_item_exist("comfyui_conn_text"):
+                dpg.set_value("comfyui_conn_text", conn_label)
+                dpg.configure_item("comfyui_conn_text", color=conn_color)
+        except Exception:
+            pass
+
+        generating = state["generating"]
+        preview_bytes = state["preview_bytes"]
+        current_progress = (state["progress_value"], state["progress_max"])
+        current_prompt_id = state.get("prompt_id")
+
+        # Detect new generation via prompt_id change (primary, most reliable)
+        if current_prompt_id and current_prompt_id != _comfyui_last_prompt_id:
+            logger.info(
+                f"[ComfyUI Monitor] New prompt_id detected: {current_prompt_id} "
+                f"(was {_comfyui_last_prompt_id}, force_hidden={_comfyui_force_hidden} → False)"
+            )
+            _comfyui_force_hidden = False
+            _comfyui_suppress_logged = False
+            _comfyui_last_prompt_id = current_prompt_id
+            _comfyui_last_progress = (0, 0)
+            _comfyui_stall_since = 0.0
+            # Clear stale progress bar and preview from previous generation
+            try:
+                if dpg.does_item_exist("comfyui_progress_bar"):
+                    dpg.configure_item("comfyui_progress_bar", default_value=0.0, overlay="")
+            except Exception:
+                pass
+            try:
+                placeholder = Image.new(
+                    "RGBA", (_COMFYUI_PREVIEW_SIZE, _COMFYUI_PREVIEW_SIZE), (60, 60, 80, 255)
+                )
+                floats = [b / 255.0 for b in placeholder.tobytes("raw", "RGBA")]
+                if dpg.does_item_exist("comfyui_preview_tex"):
+                    dpg.set_value("comfyui_preview_tex", floats)
+            except Exception:
+                pass
+
+        # Also detect via generating state transition (secondary, for robustness)
+        if generating and not _comfyui_prev_generating:
+            if _comfyui_force_hidden:
+                logger.info(
+                    f"[ComfyUI Monitor] Generating transition cleared force_hidden "
+                    f"(prompt_id={current_prompt_id})"
+                )
+            _comfyui_force_hidden = False
+            _comfyui_suppress_logged = False
+
+        _comfyui_prev_generating = generating
+
+        if generating:
+            # Active generation — show UI and keep it visible
+            _comfyui_hide_after = 0.0
+
+            # Stall detection: if progress hasn't changed for 15s, force hide
+            if current_progress != _comfyui_last_progress:
+                _comfyui_last_progress = current_progress
+                _comfyui_stall_since = now
+                _comfyui_force_hidden = False  # progress resumed / changed
+            elif _comfyui_stall_since > 0 and (now - _comfyui_stall_since) > 15.0:
+                logger.warning("[ComfyUI Monitor] Progress stalled for 15s — forcing hide (stuck generation)")
+                _comfyui_visible = False
+                _comfyui_hide_after = 0.0
+                _comfyui_stall_since = 0.0
+                _comfyui_force_hidden = True  # prevent re-show until progress resumes or new gen starts
+                try:
+                    dpg.configure_item("comfyui_progress_group", show=False)
+                    if dpg.does_item_exist("comfyui_progress_bar"):
+                        dpg.configure_item("comfyui_progress_bar", default_value=0.0, overlay="")
+                    dpg.configure_item("comfyui_preview_group", show=False)
+                except Exception:
+                    pass
+                # Also consume any leftover preview
+                if preview_bytes:
+                    daemon.consume_preview()
+                return
+
+            max_val = max(state["progress_max"], 1)
+            fraction = min(state["progress_value"] / max_val, 1.0)
+            overlay = f"{state['progress_value']} / {state['progress_max']} steps"
+
+            if not _comfyui_visible and not _comfyui_force_hidden:
+                logger.info(
+                    f"[ComfyUI Monitor] Showing UI: progress={current_progress}, "
+                    f"prompt_id={current_prompt_id}"
+                )
+                _comfyui_visible = True
+                _comfyui_stall_since = now
+                _comfyui_last_progress = current_progress
+                try:
+                    dpg.configure_item("comfyui_progress_group", show=True)
+                    dpg.configure_item("comfyui_preview_group", show=True)
+                except Exception:
+                    pass
+
+            elif not _comfyui_visible and _comfyui_force_hidden and not _comfyui_suppress_logged:
+                _comfyui_suppress_logged = True
+                logger.warning(
+                    f"[ComfyUI Monitor] UI suppressed: force_hidden=True, "
+                    f"progress={current_progress}, last_progress={_comfyui_last_progress}, "
+                    f"stall_since={_comfyui_stall_since:.1f}"
+                )
+
+            # Update progress bar
+            try:
+                if dpg.does_item_exist("comfyui_progress_bar"):
+                    dpg.configure_item("comfyui_progress_bar", default_value=fraction, overlay=overlay)
+            except Exception:
+                pass
+
+        elif _comfyui_visible:
+            # Generation ended — reset stall tracking and schedule auto-hide
+            _comfyui_stall_since = 0.0
+            _comfyui_last_progress = (0, 0)
+            _comfyui_force_hidden = False
+
+            if _comfyui_hide_after == 0.0:
+                _comfyui_hide_after = now + 3.0
+
+            if now >= _comfyui_hide_after:
+                # Time to hide
+                _comfyui_visible = False
+                _comfyui_hide_after = 0.0
+                try:
+                    dpg.configure_item("comfyui_progress_group", show=False)
+                    if dpg.does_item_exist("comfyui_progress_bar"):
+                        dpg.configure_item("comfyui_progress_bar", default_value=0.0, overlay="")
+                except Exception:
+                    pass
+                try:
+                    dpg.configure_item("comfyui_preview_group", show=False)
+                except Exception:
+                    pass
+            else:
+                # Show "done" state during grace period
+                try:
+                    if dpg.does_item_exist("comfyui_progress_bar"):
+                        dpg.configure_item("comfyui_progress_bar", default_value=1.0, overlay="done")
+                except Exception:
+                    pass
+
+        # Process preview bytes whenever available (independent of generating flag)
+        # Always consume after processing attempt to prevent stale data blocking the UI
+        if preview_bytes:
+            try:
+                from comfyui_monitor import make_square_preview, rgba_to_float_list
+                rgba = make_square_preview(preview_bytes, _COMFYUI_PREVIEW_SIZE)
+                if rgba:
+                    float_list = rgba_to_float_list(rgba)
+                    expected_len = _COMFYUI_PREVIEW_SIZE * _COMFYUI_PREVIEW_SIZE * 4
+                    if len(float_list) == expected_len:
+                        if dpg.does_item_exist("comfyui_preview_tex"):
+                            dpg.set_value("comfyui_preview_tex", float_list)
+                        if dpg.does_item_exist("comfyui_preview_image"):
+                            dpg.configure_item("comfyui_preview_image", texture_tag="comfyui_preview_tex")
+                    else:
+                        logger.warning(
+                            f"[ComfyUI Monitor] Preview float list length mismatch: "
+                            f"got {len(float_list)}, expected {expected_len}"
+                        )
+                else:
+                    logger.debug("[ComfyUI Monitor] make_square_preview returned None — binary frame may be malformed")
+            except Exception as e:
+                logger.debug(f"[ComfyUI Monitor] preview update failed: {e}")
+            finally:
+                # ALWAYS consume preview bytes after attempting to process them.
+                daemon.consume_preview()
+
+    except Exception as e:
+        logger.debug(f"[ComfyUI Monitor] tick error: {e}")
+    finally:
+        try:
+            target_frame = dpg.get_frame_count() + 2
+            dpg.set_frame_callback(target_frame, _update_comfyui_monitor)
+        except Exception as e:
+            logger.error(f"[ComfyUI Monitor] FAILED to reschedule callback: {e}")
+
+
+# ============================================================================
 # GUI Setup
 # ============================================================================
 
 def setup_gui():
     dpg.create_context()
     dpg.add_texture_registry(tag="chat_texture_registry", show=False)
+
+    _comfyui_placeholder = Image.new("RGBA", (_COMFYUI_PREVIEW_SIZE, _COMFYUI_PREVIEW_SIZE), (60, 60, 80, 255))
+    _comfyui_tex_init = [b / 255.0 for b in _comfyui_placeholder.tobytes("raw", "RGBA")]
+    dpg.add_dynamic_texture(
+        _COMFYUI_PREVIEW_SIZE, _COMFYUI_PREVIEW_SIZE, _comfyui_tex_init,
+        tag="comfyui_preview_tex", parent="chat_texture_registry",
+    )
     font_path = find_available_font()
     if font_path:
         with dpg.font_registry():
@@ -685,6 +1052,11 @@ def setup_gui():
                 with dpg.child_window(tag="ai_thoughts_area", height=-1, label="[SYSTEM] LOG", border=True):
                     dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100,100,100))
 
+                with dpg.group(tag="comfyui_progress_group", show=False):
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("ComfyUI:", color=(255, 200, 100))
+                        dpg.add_progress_bar(tag="comfyui_progress_bar", width=-1, height=14, default_value=0.0, overlay="")
+
                 with dpg.group(horizontal=True, tag="input_row"):
                     dpg.add_input_text(tag="user_input", width=-220, hint="Type your message...", on_enter=True, callback=on_send_message)
                     dpg.add_button(label="Send", callback=on_send_message, width=70)
@@ -699,7 +1071,7 @@ def setup_gui():
                     dpg.add_item_resize_handler(callback=on_left_panel_resize)
                 dpg.bind_item_handler_registry("left_panel", "left_panel_resize_handler")
 
-            with dpg.child_window(width=330, border=True, label="Control Panel", horizontal_scrollbar=True):
+            with dpg.child_window(tag="control_panel", width=330, border=True, label="Control Panel", horizontal_scrollbar=True):
                 dpg.add_text("Chat Backend", color=(200,200,255))
                 dpg.add_radio_button(tag="chat_mode_radio", items=["ollama", "llama"], default_value=runtime.runtime_chat_mode, horizontal=True, callback=on_chat_mode_changed)
 
@@ -734,9 +1106,42 @@ def setup_gui():
                 dpg.add_spacer(height=5)
                 dpg.add_text("Note: Changing embedding model requires same vector dimension.", color=(200,150,100), wrap=270)
 
+                with dpg.group(tag="comfyui_preview_group", show=False):
+                    dpg.add_separator()
+                    dpg.add_spacer(height=5)
+                    dpg.add_text("ComfyUI Generation", color=(255, 200, 100))
+                    dpg.add_image("comfyui_preview_tex", tag="comfyui_preview_image", width=_COMFYUI_PREVIEW_SIZE, height=_COMFYUI_PREVIEW_SIZE)
+                    dpg.add_spacer(height=5)
+                    dpg.add_button(label="Cancel & Free Memory", tag="comfyui_cancel_btn", callback=_on_comfyui_cancel, width=-1)
+
+                with dpg.group(tag="comfyui_status_group"):
+                    dpg.add_separator()
+                    dpg.add_spacer(height=5)
+                    dpg.add_text("ComfyUI: Disconnected", tag="comfyui_conn_text", color=(200, 100, 100))
+
+                if runtime.settings.debug:
+                    with dpg.group(tag="comfyui_debug_group"):
+                        dpg.add_separator()
+                        dpg.add_spacer(height=5)
+                        dpg.add_text("ComfyUI DEBUG", color=(255, 100, 100))
+                        dpg.add_button(
+                            label="Generate Test Image",
+                            tag="comfyui_debug_gen_btn",
+                            callback=_on_comfyui_debug_generate,
+                            width=-1,
+                        )
+
     dpg.setup_dearpygui()
     dpg.show_viewport()
     apply_window_geometry()
     dpg.set_frame_callback(1, update_split_heights)
+    dpg.set_frame_callback(2, _update_comfyui_monitor)
+
+    # Start watchdog thread to restart monitor if frame callback chain breaks
+    _comfyui_watchdog_stop.clear()
+    _watchdog = threading.Thread(
+        target=_comfyui_watchdog_thread, daemon=True, name="ComfyUIMonitorWatchdog"
+    )
+    _watchdog.start()
 
     refresh_character_list()
