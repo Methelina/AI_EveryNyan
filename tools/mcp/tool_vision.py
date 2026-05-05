@@ -9,9 +9,13 @@ and preferentially uses it when vision.prefer_chat_model is enabled.
 
 /tools/mcp/tool_vision.py
 
-Version:     0.3.4
+Version:     0.3.5
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-05-05
+
+Patch Notes v0.3.5 (by pytraveler):
+  [FIX] Added docstring to describe_image tool so the LLM can understand
+        what the tool does, when to call it, and what each parameter means.
 
 Patch Notes v0.3.4 (by pytraveler):
   [+] Auto-detect vision capability of the active chat LLM (Ollama / llama.cpp).
@@ -572,6 +576,28 @@ async def describe_image(
     prompt: str = DEFAULT_PROMPT,
     is_url: bool = False
 ) -> str:
+    """
+    Analyze an image using a vision-language model and return a detailed description.
+
+    Use this tool whenever the user sends an image, references an image file or URL,
+    or asks to describe / analyze what is visible in a picture.
+    For example: "What's in this image?", "Describe this photo", "Analyze this picture".
+
+    The tool downloads the image (if URL) or reads it from disk (if local path),
+    converts it to PNG, resizes if needed, and sends it to the configured VL model.
+
+    In structured_json mode (default), returns a comprehensive JSON object describing
+    the image content using one of two schemas:
+      - Schema A (human/character): age, gender, body type, attire, pose, environment, etc.
+      - Schema B (scene/object): scene type, location, lighting, composition, atmosphere, etc.
+    In free_text mode, returns a natural language description based on the given prompt.
+
+    Parameters:
+    - image_source: Path to a local image file OR a URL pointing to an image.
+    - prompt: Custom text prompt for the VL model (only used in free_text mode).
+              Ignored in structured_json mode. Default: "What do you see in this image?"
+    - is_url: Set to True if image_source is a URL, False (default) if it is a local file path.
+    """
     report_to_console(
         f"describe_image called: source={image_source[:100]}, is_url={is_url}, "
         f"mode={PROMPT_MODE}, active_model={ACTIVE_MODEL} ({ACTIVE_BACKEND})"

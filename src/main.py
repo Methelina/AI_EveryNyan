@@ -4,9 +4,14 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 src/main.py
-Version:     0.17.7 (Modular refactoring)
+Version:     0.17.8
 Author:      Soror L.'.L.'.
-Updated:     2026-05-03
+Updated:     2026-05-05
+
+Patch Notes v0.17.8 (by pytraveler):
+  [+] ComfyUI daemon integration: initialize and start ComfyUIDaemon at startup
+      with configurable check_interval from settings.
+  [+] Graceful shutdown: stop ComfyUI monitor watchdog and daemon on exit.
 
 Patch Notes v0.17.7 (by pytraveler):
   [+] ComfyUI image path injection: _extract_image_paths() extracts file paths from
@@ -361,6 +366,13 @@ def main():
     refresh_models_list()
     init_query_preprocessor()
 
+    from comfyui_monitor import ComfyUIDaemon
+    runtime.comfyui_daemon = ComfyUIDaemon(
+        server=runtime.settings.comfyui.server,
+        check_interval=runtime.settings.comfyui.daemon_check_interval,
+    )
+    runtime.comfyui_daemon.start()
+
     future = asyncio.run_coroutine_threadsafe(init_mcp_agent(), runtime.async_loop)
     try:
         future.result(timeout=30)
@@ -387,6 +399,11 @@ def main():
             add_ai_thought("[SYS] No context to save on exit.", (200,200,100))
         if runtime.mcp_client:
             logger.info("[MCP] Client released (no explicit close needed)")
+        # Stop ComfyUI monitor watchdog before daemon
+        from gui import _comfyui_watchdog_stop
+        _comfyui_watchdog_stop.set()
+        if runtime.comfyui_daemon:
+            runtime.comfyui_daemon.stop()
         runtime.async_loop.call_soon_threadsafe(runtime.async_loop.stop)
         runtime.async_thread.join(timeout=2.0)
         if runtime.memory_manager:
