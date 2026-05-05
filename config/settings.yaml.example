@@ -129,12 +129,23 @@ gui:
 logging:
   level: "INFO"
   file: "logs/app.log"
-  
+
 # ComfyUI image generation
 comfyui:
   server: "127.0.0.1:8084"
   workflow_dir: "workflows"
   output_dir: "data/comfyui_output"
   http_timeout: 120
+  daemon_check_interval: 5.0        # seconds between ComfyUI reconnect attempts
+
+# Read-only workspace for LLM file access (sandboxed, no write/modify/delete)
+workspace:
+  workspace_dir: "."                # sandboxed root (relative to project root; "." = entire project, read-only)
+  max_file_size: 10485760           # 10 MB — files larger than this are rejected
+  max_read_lines: 2000              # max text lines returned by read_file
+  max_read_bytes: 1048576           # 1 MB — max bytes returned in binary mode
+  max_search_results: 200           # cap for search_files / grep_content results
+  allow_hidden_files: false         # whether to show dotfiles in listings
+  max_line_count_size: 1048576      # compute line count only for files <= this size
 
 debug: false

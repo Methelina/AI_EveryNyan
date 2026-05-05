@@ -28,7 +28,6 @@ Patch Notes v0.1.0 (by Soror L.'.L.):
 import os
 import sys
 import json
-import uuid
 import urllib.request
 import urllib.parse
 import yaml
@@ -118,17 +117,23 @@ def _get_image(filename: str, subfolder: str, folder_type: str) -> bytes:
         return resp.read()
 
 
-def _wait_for_completion(ws, prompt_id: str) -> None:
-    while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message.get("type") == "executing":
-                data = message.get("data", {})
-                if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                    break
-        elif isinstance(out, bytes):
-            continue
+def _poll_for_completion(prompt_id: str, timeout: int = 300, interval: float = 1.0) -> None:
+    """Poll /history/{prompt_id} via HTTP until generation completes.
+    
+    Replaces the previous WS-based wait so the daemon's WS connection
+    is the sole recipient of progress/preview events.
+    """
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        _time.sleep(interval)
+        try:
+            history = _get_history(prompt_id)
+            if prompt_id in history:
+                return
+        except Exception:
+            pass
+    raise TimeoutError(f"Generation did not complete within {timeout}s")
 
 
 def _collect_output_images(prompt_id: str) -> Dict[str, List[bytes]]:
@@ -259,8 +264,6 @@ async def generate_image(
     - workflow_file: Filename of a workflow JSON in the workflows directory. If empty, uses 'default.json'.
     - node_overrides: JSON string with per-node input overrides, e.g. '{"1":{"ckpt_name":"model.safetensors"}}'. Optional.
     """
-    import websocket as _ws
-
     _log(f"generate_image called: positive={positive_prompt!r}, negative={negative_prompt!r}")
 
     wf_name = workflow_file.strip() or "default.json"
@@ -289,7 +292,7 @@ async def generate_image(
         overrides if overrides else None,
     )
 
-    client_id = str(uuid.uuid4())
+    client_id = os.environ.get("COMFYUI_CLIENT_ID", "ai_everynyan")
 
     try:
         result = _queue_prompt(workflow, client_id)
@@ -302,16 +305,15 @@ async def generate_image(
         _log(f"No prompt_id in response: {result}")
         return f"Error: ComfyUI did not return a prompt_id. Response: {result}"
 
-    _log(f"Queued prompt_id={prompt_id}, waiting for completion...")
+    _log(f"Queued prompt_id={prompt_id}, waiting for completion (HTTP polling)...")
 
     try:
-        ws = _ws.WebSocket()
-        ws.connect(f"ws://{COMFYUI_SERVER}/ws?clientId={client_id}", timeout=HTTP_TIMEOUT)
-        _wait_for_completion(ws, prompt_id)
-        ws.close()
+        _poll_for_completion(prompt_id, timeout=HTTP_TIMEOUT)
+    except TimeoutError as e:
+        return f"Error: {e}"
     except Exception as e:
-        _log(f"WebSocket error: {e}")
-        return f"Error: WebSocket communication with ComfyUI failed: {e}"
+        _log(f"Completion poll error: {e}")
+        return f"Error: Failed while waiting for ComfyUI: {e}"
 
     images = _collect_output_images(prompt_id)
     if not images:
