@@ -44,12 +44,66 @@
 ### 🧹 Лемматизация для RAG (через spaCy)
 Текст сообщений и дневников перед индексацией обрабатывается через `ru_core_news_sm` и `en_core_web_sm`, что повышает качество поиска.
 
-### 🔧 MCP + Веб-инструменты (v0.16.2)
-Интегрированы инструменты через **Model Context Protocol**:
-- **Веб-поиск через SearXNG** — анонимный метапоиск (без API-ключей).
-- **Извлечение содержимого URL** — с поддержкой трёх режимов: `legacy` (httpx+bs4), `playwright` (полный браузер), `nodriver` (лёгкий CDP). Автоматическое очищение HTML → Markdown.
+### 🔧 MCP-инструменты (Model Context Protocol)
+Все инструменты автоматически обнаруживаются из `tools/mcp/tool_*.py` и подключаются через stdio-транспорт. Каждый инструмент — независимый FastMCP-сервер.
+
+#### 🌐 Веб-поиск и навигация (SearXNG)
+- **`web_search`** — анонимный метапоиск через SearXNG (без API-ключей). Результат в Markdown.
+- **`fetch_url`** — извлечение содержимого веб-страниц с поддержкой трёх режимов: `legacy` (httpx+bs4), `playwright` (полный браузер), `nodriver` (лёгкий CDP). Автоматическое очищение HTML → Markdown.
+- **`open_url`** — открытие ссылки в системном браузере пользователя.
+
+#### 🧮 Математика и конвертация
+- **`calculate`** — безопасный калькулятор математических выражений (арифметика, тригонометрия, логарифмы, `pi`, `e`).
+- **`convert_units`** — конвертация единиц: температура (C/F/K), длина, вес, объём данных, время.
+
+#### 💱 Курсы валют
+- **`convert_currency`** — конвертация суммы между валютами по актуальным курсам (без API-ключей, ~150+ валют).
+- **`exchange_rate`** — текущий курс для пары или группы валют.
+- **`list_currencies`** — список всех поддерживаемых валют.
+
+#### 🕐 Дата и время
+- **`get_datetime`** — текущая дата/время с поддержкой таймзон и произвольного форматирования.
+- **`get_timestamp`** — Unix timestamp и ISO 8601.
+- **`format_datetime`** — форматирование timestamp в читаемый вид.
+- **`time_diff`** — человекочитаемая разница между двумя датами.
+
+#### 🌤️ Погода
+- **`get_weather`** — текущая погода для города/координат (через wttr.in, без API-ключей).
+- **`get_forecast`** — прогноз на 3 дня.
+
+#### 🎲 Генерация случайных значений
+- **`generate_uuid`** — UUID v4 (random) или v7 (time-ordered).
+- **`generate_random_string`** — пароли, токены, произвольные строки с выбором charset.
+- **`generate_random_number`** — случайные числа (int/float) в диапазоне.
+- **`pick_random`** — случайный выбор из списка.
+
+#### 📁 Песочница файловой системы (Workspace)
+Только чтение, все пути валидируются против `workspace_dir` (путь traversal и symlink-эскейпы блокируются).
+- **`read_file`** — чтение файла (текст/бинарный, с offset/limit).
+- **`check_path`** — проверка существования и типа пути.
+- **`list_directory`** — содержимое директории с сортировкой и фильтрацией.
+- **`search_files`** — поиск файлов по glob-паттерну.
+- **`directory_tree`** — дерево директорий.
+- **`file_info`** — метаданные файла (размер, даты, строки, SHA-256).
+- **`grep_content`** — поиск по содержимому файлов (regex).
+
+#### 🖥️ Системная информация
+- **`get_system_info`** — ОС, hostname, uptime, CPU, RAM, диск (с фильтрацией секций).
+
+#### 👁️ Vision (анализ изображений)
+- **`describe_image`** — анализ изображения через VL-модель. Авто-определение vision-способности активного чат-модели (Ollama / llama.cpp). Два режима: `structured_json` (детальный JSON: человек/сцена) и `free_text`. Поддержка локальных файлов и URL.
+
+#### 🎨 Генерация изображений (ComfyUI)
+- **`generate_image`** — генерация через ComfyUI: отправка workflow, ожидание через HTTP polling, сохранение результатов на диск.
+- **`list_workflows`** — список доступных workflow JSON из `workflows/`.
+
+#### 🧑‍🎨 Управление персонажем
+- **`update_character_appearance`** — изменение внешности активного персонажа через LLM: волосы, одежда, макияж, аксессуары и т.д. Система проекций (`reprojection/`) с Pydantic-валидацией и locked-полями.
+
+#### 🔧 Инфраструктура
 - **Цветное логирование** всех вызовов инструментов и результатов в панели SYSTEM LOG.
-- **Fallback при ошибках агента** — если MCP агент упал, система переключается на прямой вызов LLM.
+- **Fallback при ошибках агента** — если MCP-агент упал, система переключается на прямой вызов LLM.
+- **Автообнаружение** — все `tool_*.py` подключаются автоматически через `__init__.py`.
 
 ---
 
@@ -109,7 +163,19 @@ AI_EveryNyan/
 │   ├── memory_manager.py      # v0.7.0: JSON-метаданные, циркумплексная модель
 │   └── query_preprocessor.py  # v0.2.0: лемматизация
 ├── tools/mcp/
-│   └── tool_searxng.py        # v0.4.0: SearXNG + fetch (playwright/nodriver/legacy)
+│   ├── __init__.py             # автообнаружение tool_*.py, MultiServerMCPClient
+│   ├── tool_searxng.py         # v0.4.2: SearXNG + fetch_url (playwright/nodriver/legacy)
+│   ├── tool_browser.py         # v0.1.0: open_url
+│   ├── tool_calculator.py      # v0.1.0: calculate + convert_units
+│   ├── tool_currency.py        # v0.1.0: конвертация валют (frankfurter.app + open.er-api.com)
+│   ├── tool_datetime.py        # v0.1.0: дата/время, таймзоны, time_diff
+│   ├── tool_weather.py         # v0.1.0: погода wttr.in (текущая + прогноз 3 дня)
+│   ├── tool_random.py          # v0.1.0: UUID, строки, числа, случайный выбор
+│   ├── tool_workspace.py       # v0.1.0: read-only песочница файловой системы
+│   ├── tool_system.py          # v0.1.0: информация об ОС, CPU, RAM, дисках
+│   ├── tool_vision.py          # v0.3.5: анализ изображений (VL-модели)
+│   ├── tool_comfyui.py         # v0.1.0: генерация изображений (ComfyUI API)
+│   └── tool_character.py       # v0.4.0: управление внешностью персонажа
 ├── config/
 │   ├── settings.yaml
 │   └── character/
@@ -136,9 +202,21 @@ GUI (DearPyGui) в главном потоке, LLM-запросы и RAG — в
 7. **Сохранение** диалога в DuckDB и Qdrant с извлечением метаданных.
 8. **Smart Dump** — при переполнении контекста пишется дневник с JSON-метаданными.
 
-### 3. MCP инструменты
-- `web_search(query, categories, language, max_results)` — поиск через SearXNG, результат в Markdown.
-- `fetch_url(url, max_length)` — скачивание страницы, очистка, конвертация в Markdown. Режим выбирается переменной `FETCH_MODE` (legacy/playwright/nodriver).
+### 3. MCP инструменты (12 серверов, 30+ инструментов)
+| Сервер | Инструменты | Описание |
+| :--- | :--- | :--- |
+| `tool_searxng` | `web_search`, `fetch_url` | Веб-поиск (SearXNG) и извлечение страниц |
+| `tool_browser` | `open_url` | Открытие ссылок в браузере |
+| `tool_calculator` | `calculate`, `convert_units` | Математика и конвертация единиц |
+| `tool_currency` | `convert_currency`, `exchange_rate`, `list_currencies` | Курсы валют |
+| `tool_datetime` | `get_datetime`, `get_timestamp`, `format_datetime`, `time_diff` | Дата и время |
+| `tool_weather` | `get_weather`, `get_forecast` | Погода (wttr.in) |
+| `tool_random` | `generate_uuid`, `generate_random_string`, `generate_random_number`, `pick_random` | Генерация случайных значений |
+| `tool_workspace` | `read_file`, `check_path`, `list_directory`, `search_files`, `directory_tree`, `file_info`, `grep_content` | Песочница файловой системы (read-only) |
+| `tool_system` | `get_system_info` | Системная информация |
+| `tool_vision` | `describe_image` | Анализ изображений (VL-модели) |
+| `tool_comfyui` | `generate_image`, `list_workflows` | Генерация изображений (ComfyUI) |
+| `tool_character` | `update_character_appearance` | Управление внешностью персонажа |
 
 ---
 
@@ -165,9 +243,19 @@ GUI (DearPyGui) в главном потоке, LLM-запросы и RAG — в
 - ✅ Стриминг ответов для LLaMA-режима.
 - ✅ Структурированные метаданные дневника (JSON + циркумплексная модель аффекта).
 - ✅ Лемматизация текста для улучшенного RAG (spaCy).
-- ✅ **MCP (Model Context Protocol) + полноценные инструменты** — интеграция агента LangGraph, загрузка инструментов из MCP-сервера. Вызовы и результаты логируются с цветовой индикацией.
-- ✅ **SearXNG Web Search** — анонимный метапоиск.
-- ✅ **Fetch URL** — извлечение содержимого веб-страниц с поддержкой Playwright/Nodriver для JS-сайтов.
+- ✅ **MCP-инструменты (12 серверов, 30+ инструментов)** — автообнаружение, stdio-транспорт, цветное логирование, fallback.
+- ✅ **Веб-поиск (SearXNG)** и **извлечение URL** (legacy/playwright/nodriver).
+- ✅ **Открытие ссылок в браузере** (`open_url`).
+- ✅ **Калькулятор и конвертация единиц** (температура, длина, вес, данные, время).
+- ✅ **Конвертация валют** (~150+ валют, без API-ключей).
+- ✅ **Дата и время** с таймзонами, форматированием и вычислением разницы.
+- ✅ **Погода** — текущая погода и прогноз на 3 дня (wttr.in).
+- ✅ **Генерация случайных значений** — UUID, строки, числа, выбор из списка.
+- ✅ **Read-only песочница файловой системы** — чтение, поиск, дерево, grep, метаданные.
+- ✅ **Системная информация** — ОС, CPU, RAM, диски.
+- ✅ **Vision — анализ изображений** через VL-модели (автодетект vision-способности чат-модели).
+- ✅ **Генерация изображений (ComfyUI)** — отправка workflow, сохранение результатов.
+- ✅ **Управление внешностью персонажа** — проекции, Pydantic-валидация, locked-поля.
 - ✅ Исправлен критический баг с `None`-ответами в LLaMA-режиме.
 - ✅ Graceful shutdown и цветное логирование MCP.
 
@@ -180,7 +268,6 @@ GUI (DearPyGui) в главном потоке, LLM-запросы и RAG — в
 - **Динамическая адаптация RAG** (автоподстройка `top_k` и порога).
 - **Semantic Chunker** — умное разбиение длинных текстов.
 - **NER Enrichment** — автоматическое извлечение имён, дат.
-- **Галерея и генерация изображений** (vision-LLM, Stable Diffusion).
 - **Напоминания и планировщик**.
 
 ---
