@@ -3,9 +3,18 @@ DearPyGui GUI setup, control panel callbacks, AI thoughts display, and splitter 
 Handles viewport, theming, chat rendering, model selection, and runtime parameter controls.
 
 src/gui.py
-Version:     0.19.0
+Version:     0.19.2
 Author:      Soror L'.L'.
 Updated:     2026-09-30
+
+Patch Notes v0.19.2 (Soror L'.L'.):
+  [+] Drop-cap avatar layout: with an avatar present the first
+      _AVATAR_TEXT_LINES (4) message lines run beside the image in a
+      narrowed column (_split_message_for_avatar word-boundary split) and
+      the tail continues at full width below — simulated text wrap-around.
+  [+] _chat_text_tags is now a dict tag -> "head"|"tail" so
+      _refresh_text_wrap_widths applies the right wrap per widget on
+      resize; streaming updates recompute the head/tail split per chunk.
 
 Patch Notes v0.19.1 (Soror L'.L'.):
   [+] Restored the v0.18.x redesign lost to a destructive subagent restore:
@@ -166,8 +175,31 @@ def apply_window_geometry():
             logger.debug(f"Could not apply window geometry: {e}")
 
 
-# Tags of add_text widgets in chat_area whose wrap width must track resize.
-_chat_text_tags: list = []
+# Tracked chat text widgets: tag -> "head" (beside avatar, narrowed) | "tail"
+# (full width, below the avatar drop-cap block).
+_chat_text_tags: dict = {}
+
+# Drop-cap avatar layout: head lines run beside the avatar, the rest of the
+# message continues at full width below it (simulated text wrap-around).
+_AVATAR_COL_RESERVE = 150   # px reserved for the avatar column + margins
+_AVATAR_TEXT_LINES = 4      # avatar occupies this many text lines
+_CHAT_CHAR_W = 9            # px per char in font_chat (VCR OSD Mono, 16 px)
+
+
+def _split_message_for_avatar(text: str, wrap_w: int) -> Tuple[str, str]:
+    """Split a message into (head, tail) for the drop-cap avatar layout.
+
+    head fits beside the avatar (narrow column, _AVATAR_TEXT_LINES lines),
+    tail continues at full width below. The split lands on a word boundary
+    when possible. Empty tail when the message fits beside the avatar.
+    """
+    head_chars = max(20, int((wrap_w - _AVATAR_COL_RESERVE) / _CHAT_CHAR_W)) * _AVATAR_TEXT_LINES
+    if len(text) <= head_chars:
+        return text, ""
+    cut = text.rfind(" ", 0, head_chars)
+    if cut < head_chars // 2:
+        cut = head_chars
+    return text[:cut], text[cut:].lstrip()
 
 
 def get_chat_wrap_width() -> int:
@@ -201,10 +233,11 @@ def get_thoughts_wrap_width() -> int:
 def _refresh_text_wrap_widths():
     """Re-apply wrap width to every tracked chat text widget."""
     w = get_chat_wrap_width()
-    for tag in _chat_text_tags:
+    for tag, kind in _chat_text_tags.items():
         try:
             if dpg.does_item_exist(tag):
-                dpg.configure_item(tag, wrap=w)
+                ww = w - _AVATAR_COL_RESERVE if kind == "head" else w
+                dpg.configure_item(tag, wrap=ww)
         except Exception:
             pass
 
@@ -229,41 +262,49 @@ def add_ai_thought(text: str, color: Tuple[int, int, int] = _COL_ACCENT):
 
 
 def update_ai_message_streaming(text: str):
-    tag = runtime._current_ai_message_tag
-    if tag and dpg.does_item_exist(tag):
-        dpg.set_value(tag, text)
+    tags = runtime._current_ai_message_tag
+    if isinstance(tags, dict) and dpg.does_item_exist(tags.get("head", "")):
+        head, tail = _split_message_for_avatar(text, get_chat_wrap_width())
+        dpg.set_value(tags["head"], head)
+        if tags.get("tail") and dpg.does_item_exist(tags["tail"]):
+            dpg.set_value(tags["tail"], tail)
+        dpg.set_y_scroll("chat_area", 1e9)
+        return
+    if tags and dpg.does_item_exist(tags):
+        dpg.set_value(tags, text)
     else:
-        wrap_w = get_chat_wrap_width() - 150
+        wrap_w = get_chat_wrap_width()
         avatar = _get_avatar_for_sender("AI_EveryNyan")
         with dpg.group(parent="chat_area", horizontal=False):
             if avatar is not None:
                 tex_tag, av_w, av_h = avatar
+                head, tail = _split_message_for_avatar(text, wrap_w)
                 with dpg.group(horizontal=True):
-                    dpg.add_image(
-                        tex_tag,
-                        tag=f"ava_{uuid.uuid4().hex[:8]}",
-                        width=av_w,
-                        height=av_h,
-                    )
-                    with dpg.group():
-                        dpg.add_text("AI_EveryNyan:", color=_COL_ACCENT)
-                        msg_body = dpg.add_group(indent=20)
-                        runtime._current_ai_message_tag = dpg.add_text(text, wrap=wrap_w, parent=msg_body)
-                        _chat_text_tags.append(runtime._current_ai_message_tag)
-                        try:
-                            dpg.bind_item_font(runtime._current_ai_message_tag, "font_chat")
-                        except Exception as e:
-                            logger.debug(f"[GUI] fallback: could not bind font_chat to streaming text: {e}")
+                    dpg.add_image(tex_tag, tag=f"ava_{uuid.uuid4().hex[:8]}", width=av_w, height=av_h)
+                    head_tag = dpg.add_text(head, wrap=wrap_w - _AVATAR_COL_RESERVE)
+                tail_tag = None
+                if tail:
+                    tail_tag = dpg.add_text(tail, wrap=wrap_w)
+                runtime._current_ai_message_tag = {"head": head_tag, "tail": tail_tag}
+                bound_tags = [head_tag, tail_tag]
             else:
                 with dpg.group(horizontal=True):
-                    dpg.add_text("AI_EveryNyan:", color=_COL_ACCENT)
-                with dpg.group(indent=20):
-                    runtime._current_ai_message_tag = dpg.add_text(text, wrap=wrap_w)
-                    _chat_text_tags.append(runtime._current_ai_message_tag)
-                    try:
-                        dpg.bind_item_font(runtime._current_ai_message_tag, "font_chat")
-                    except Exception as e:
-                        logger.debug(f"[GUI] fallback: could not bind font_chat to streaming text: {e}")
+                    dpg.add_text("AI_EVERYNYAN:", color=_COL_ACCENT)
+                msg_tag = dpg.add_text(text, wrap=wrap_w, indent=20)
+                runtime._current_ai_message_tag = msg_tag
+                bound_tags = [msg_tag]
+            if avatar is not None:
+                _chat_text_tags[head_tag] = "head"
+                if tail_tag:
+                    _chat_text_tags[tail_tag] = "tail"
+            else:
+                _chat_text_tags[msg_tag] = "tail"
+            try:
+                for t in bound_tags:
+                    if t:
+                        dpg.bind_item_font(t, "font_chat")
+            except Exception as e:
+                logger.debug(f"[GUI] fallback: could not bind font_chat to streaming text: {e}")
         dpg.set_y_scroll("chat_area", 1e9)
 
 
@@ -305,7 +346,7 @@ def update_split_heights():
     dpg.configure_item("chat_area", height=chat_height)
 
     global _chat_text_tags
-    _chat_text_tags = [t for t in _chat_text_tags if dpg.does_item_exist(t)]
+    _chat_text_tags = {t: k for t, k in _chat_text_tags.items() if dpg.does_item_exist(t)}
     _refresh_text_wrap_widths()
 
 
@@ -580,6 +621,7 @@ def add_chat_message(sender: str, text: str, color: tuple):
     with dpg.group(parent="chat_area", horizontal=False):
         if avatar is not None:
             tex_tag, av_w, av_h = avatar
+            head, tail = _split_message_for_avatar(clean_text, wrap_w)
             with dpg.group(horizontal=True):
                 dpg.add_image(
                     tex_tag,
@@ -589,23 +631,30 @@ def add_chat_message(sender: str, text: str, color: tuple):
                 )
                 with dpg.group():
                     dpg.add_text(f"{sender}:", color=color)
-                    msg_body = dpg.add_group(indent=20)
-                    if clean_text.strip():
-                        tag = dpg.add_text(clean_text, wrap=wrap_w - 150, parent=msg_body)
-                        _chat_text_tags.append(tag)
+                    msg_body = dpg.add_group()
+                    if head.strip():
+                        tag = dpg.add_text(head, wrap=wrap_w - _AVATAR_COL_RESERVE, parent=msg_body)
+                        _chat_text_tags[tag] = "head"
                         try:
                             dpg.bind_item_font(tag, "font_chat")
                         except Exception as e:
                             logger.debug(f"[GUI] fallback: could not bind font_chat to chat text: {e}")
                     for img_path in image_paths:
                         _add_image_thumbnail(parent=msg_body, image_path=img_path)
+            if tail:
+                tail_tag = dpg.add_text(tail, wrap=wrap_w)
+                _chat_text_tags[tail_tag] = "tail"
+                try:
+                    dpg.bind_item_font(tail_tag, "font_chat")
+                except Exception as e:
+                    logger.debug(f"[GUI] fallback: could not bind font_chat to chat tail text: {e}")
         else:
             with dpg.group(horizontal=True):
                 dpg.add_text(f"{sender}:", color=color)
             with dpg.group(indent=20) as msg_body:
                 if clean_text.strip():
                     tag = dpg.add_text(clean_text, wrap=wrap_w)
-                    _chat_text_tags.append(tag)
+                    _chat_text_tags[tag] = "tail"
                     try:
                         dpg.bind_item_font(tag, "font_chat")
                     except Exception as e:

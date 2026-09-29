@@ -3,9 +3,18 @@ Character initialization, projection management, and system prompt builder for A
 Loads base persona, JSON appearance files, and manages reprojection persistence.
 
 /src/character.py
-Version:     0.18.1
+Version:     0.19.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-29
+Updated:     2026-09-30
+
+Patch Notes v0.19.0 (Soror L.'.L.'.):
+  [+] Per-appearance persona bases: _load_persona_base() prefers
+      config/character/base_<Set>.yaml and falls back to shared base.yaml;
+      init_character() loads the base after restoring the appearance marker;
+      on_character_selected() reloads the base on switch (applies to the
+      next message immediately - build_system_prompt() reads it per call).
+  [+] Memory note: DuckDB/Qdrant stay shared; safe while persona_name in
+      overrides equals the base one (system prompt enforces identity).
 
 Patch Notes v0.18.1 (Soror L'.L'.):
   [+] build_system_prompt(): injects current local time (<time> block) - the
@@ -42,21 +51,27 @@ current_appearance_set: str = "EveryNyan"
 current_projection_path: Optional[Path] = None
 
 
+def _load_persona_base() -> None:
+    """(Re)load character_base for the current appearance set.
+
+    Prefers a per-appearance override config/character/base_<Set>.yaml and
+    falls back to the shared base.yaml. persona_name is refreshed from the
+    loaded base. Safe to call on appearance switch: build_system_prompt()
+    reads the global on every message, so the change applies immediately.
+    """
+    global character_base, current_persona_name
+    character_base = CharacterConfig.load_base(current_appearance_set)
+    current_persona_name = character_base.meta.get("persona_name", "EveryNyan")
+
+
 def init_character():
     global character_base, character_appearance, appearance_map
     global current_persona_name, current_appearance_set, current_projection_path
     logger.info("Loading character configuration...")
-    character_base = CharacterConfig.load_base()
-
-    current_persona_name = character_base.meta.get("persona_name", "EveryNyan")
-
     appearance_map = CharacterConfig.load_appearance_json_files()
 
     if appearance_map:
-        if current_persona_name in appearance_map:
-            current_appearance_set = current_persona_name
-        else:
-            current_appearance_set = sorted(appearance_map.keys())[0]
+        current_appearance_set = sorted(appearance_map.keys())[0]
         marker_path = CharacterConfig.REPROJECTION_DIR / ".current_appearance"
         if marker_path.exists():
             try:
@@ -66,6 +81,7 @@ def init_character():
                     logger.info(f"Restored previous appearance set: {current_appearance_set}")
             except Exception as e:
                 logger.warning(f"Failed to read appearance marker: {e}")
+        _load_persona_base()
         _ensure_projection_for_current()
         character_appearance = None
         try:
@@ -75,6 +91,7 @@ def init_character():
             logger.warning(f"Failed to write appearance marker: {e}")
         logger.info(f"JSON appearances loaded. Persona: {current_persona_name}, Appearance set: {current_appearance_set}")
     else:
+        _load_persona_base()
         character_appearance = CharacterConfig.load_appearance()
         current_appearance_set = current_persona_name
         current_projection_path = None
@@ -202,6 +219,7 @@ def on_character_selected(sender, app_data):
         current_projection_path = None
         character_appearance = CharacterConfig.load_appearance()
         _save_appearance_marker(current_appearance_set)
+        _load_persona_base()
         add_ai_thought(f"[GUI] Switched to YAML appearance: {current_appearance_set}", (100,255,100))
         return
 
@@ -210,6 +228,7 @@ def on_character_selected(sender, app_data):
         _ensure_projection_for_current()
         character_appearance = None
         _save_appearance_marker(current_appearance_set)
+        _load_persona_base()
         add_ai_thought(f"[GUI] Switched appearance set to: {selected}", (100,255,100))
     else:
         logger.warning(f"Attempted to select unknown appearance set: {selected}")

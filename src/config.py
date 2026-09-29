@@ -3,9 +3,14 @@ Application configuration models and character config loader for AI_EveryNyan.
 Pydantic-based settings with YAML override. Character YAML/JSON file loader.
 
 /src/config.py
-Version:     0.18.0
+Version:     0.19.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-29
+
+Patch Notes v0.19.0 (Soror L'.L'.):
+  [+] CharacterConfig.load_base(name): optional per-appearance persona base
+      override - prefers base_<name>.yaml beside base.yaml, falls back to
+      the shared base.yaml with a logged warning when the override is absent.
 
 Patch Notes v0.18.0 (Soror L'.L'.):
   [+] OpenAICompatSettings + chat_mode "openai": generic OpenAI-compatible
@@ -254,7 +259,23 @@ class CharacterConfig:
             raise
 
     @classmethod
-    def load_base(cls) -> CharacterBaseConfig:
+    def load_base(cls, name: Optional[str] = None) -> CharacterBaseConfig:
+        """Load the persona base, optionally overridden per appearance set.
+
+        When `name` is given, prefers config/character/base_<name>.yaml and
+        falls back to the shared base.yaml when the override does not exist
+        (logged as a fallback). Memory impact is zero while persona_name in
+        the override stays the same as in base.yaml.
+        """
+        if name:
+            override = cls.BASE_PATH.with_name(f"base_{name}.yaml")
+            if override.exists():
+                logger.info(f"[CHARACTER] Using persona base override: {override.name}")
+                return cls._load_yaml_file(override, CharacterBaseConfig)
+            logger.warning(
+                f"[CHARACTER] fallback: no persona base override {override.name}, "
+                f"using shared {cls.BASE_PATH.name}"
+            )
         return cls._load_yaml_file(cls.BASE_PATH, CharacterBaseConfig)
 
     @classmethod
