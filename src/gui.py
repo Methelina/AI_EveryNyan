@@ -2,16 +2,43 @@
 DearPyGui GUI setup, control panel callbacks, AI thoughts display, and splitter management.
 Handles viewport, theming, chat rendering, model selection, and runtime parameter controls.
 
-/src/gui.py
-Version:     0.17.9
-Author:      Soror L.'.L.'.
-Updated:     2026-09-29
+src/gui.py
+Version:     0.19.0
+Author:      Soror L'.L'.
+Updated:     2026-09-30
+
+Patch Notes v0.19.1 (Soror L'.L'.):
+  [+] Restored the v0.18.x redesign lost to a destructive subagent restore:
+      CrisTical palette theme + send/reset button themes; font system
+      (font_header / font_body default / font_chat); tab layout CHAT /
+      CONSOLE / SETTINGS with uppercase font_header section headers;
+      chat_area fills left_panel minus input row (console has own tab);
+      ComfyUI debug generation picks the first workflows/*.json.
+  [+] Image avatar system (v0.19.0) kept and integrated into the restored
+      tab layout; history senders YOU / AI_EVERYNYAN with accent colors.
+
+Patch Notes v0.19.0 (Soror L'.L'.):
+  [+] Image avatar system for chat messages: avatar PNGs (ava_<appearance>.png
+    for the AI resolved from character.current_appearance_set; ava_You.png for
+    the user) are loaded from config/character, cached per file path in
+    _AVATAR_CACHE, and rendered as a 64 px-high image column (width capped at
+    128 px, aspect ratio preserved) beside each chat message.
+  [+] add_chat_message() restructured to a horizontal group: [avatar image widget]
+    + [vertical group: sender label + message text + image thumbnails]. When no
+    avatar resolves/loads, the original layout (sender label + indented text) is
+    preserved unchanged. Message-text wrap is reduced by 150 px to clear the
+    avatar column.
+  [+] update_ai_message_streaming() uses the same reduced wrap when creating the
+    streaming widget; existing streaming tags updated with set_value only.
+  [+] New color constants _COL_ACCENT / _COL_ACCENT_SOFT and avatar size constants
+    _AVATAR_SIZE_H / _AVATAR_MAX_W / _AVATAR_CACHE; _resolve_avatar_path() and
+    _get_avatar_texture() helpers with tagged fallback logging.
 
 Patch Notes v0.17.9 (Soror L'.L'.):
   [*] ComfyUI monitor logging: the 30s INFO heartbeat spammed identical state
-      while ComfyUI was offline. Now the heartbeat is debug-level, and a loud
-      INFO line is emitted only on connection TRANSITIONS (online/offline),
-      once per change.
+  while ComfyUI was offline. Now the heartbeat is debug-level, and a loud
+  INFO line is emitted only on connection TRANSITIONS (online/offline),
+  once per change.
 
 Patch Notes v0.17.8 (by pytraveler):
   [+] ComfyUI Monitor integration: real-time preview panel, progress bar, and
@@ -81,9 +108,23 @@ from character import (
     refresh_character_list,
     on_character_selected,
 )
+import character
 
 
 _WINDOW_GEOMETRY_PATH = Path("data/window_geometry.json")
+
+# Color constants: shared palette for chat senders, status, etc.
+_COL_ACCENT = (255, 200, 100)
+_COL_ACCENT_SOFT = (235, 205, 130)
+_COL_DIM = (140, 145, 155)
+_COL_MUTED = (90, 95, 105)
+_COL_NEUTRAL = (200, 200, 200)
+_COL_OK = (80, 210, 100)
+_COL_ERR = (230, 70, 70)
+_COL_WARN = (240, 200, 60)
+_COL_IDLE = (110, 110, 110)
+
+_FONTS_DIR = Path("data/fonts")
 
 
 def load_window_geometry() -> Optional[dict]:
@@ -172,7 +213,7 @@ def _refresh_text_wrap_widths():
 # AI Thoughts UI System
 # ============================================================================
 
-def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
+def add_ai_thought(text: str, color: Tuple[int, int, int] = _COL_ACCENT):
     logger.info(f"[AI_THOUGHT] {text}")
     try:
         if dpg.does_item_exist("thoughts_placeholder"):
@@ -180,7 +221,7 @@ def add_ai_thought(text: str, color: Tuple[int, int, int] = (200, 200, 150)):
         timestamp = datetime.now().strftime("%H:%M:%S")
         tw = get_thoughts_wrap_width()
         with dpg.group(parent="ai_thoughts_area", horizontal=True):
-            dpg.add_text(f"[{timestamp}] ", color=(100, 100, 100))
+            dpg.add_text(f"[{timestamp}] ", color=_COL_MUTED)
             dpg.add_text(text, color=color, wrap=tw)
         dpg.set_y_scroll("ai_thoughts_area", 1e9)
     except Exception as e:
@@ -192,13 +233,37 @@ def update_ai_message_streaming(text: str):
     if tag and dpg.does_item_exist(tag):
         dpg.set_value(tag, text)
     else:
-        wrap_w = get_chat_wrap_width()
+        wrap_w = get_chat_wrap_width() - 150
+        avatar = _get_avatar_for_sender("AI_EveryNyan")
         with dpg.group(parent="chat_area", horizontal=False):
-            with dpg.group(horizontal=True):
-                dpg.add_text("AI_EveryNyan:", color=(255,200,100))
-            with dpg.group(indent=20):
-                runtime._current_ai_message_tag = dpg.add_text(text, wrap=wrap_w)
-                _chat_text_tags.append(runtime._current_ai_message_tag)
+            if avatar is not None:
+                tex_tag, av_w, av_h = avatar
+                with dpg.group(horizontal=True):
+                    dpg.add_image(
+                        tex_tag,
+                        tag=f"ava_{uuid.uuid4().hex[:8]}",
+                        width=av_w,
+                        height=av_h,
+                    )
+                    with dpg.group():
+                        dpg.add_text("AI_EveryNyan:", color=_COL_ACCENT)
+                        msg_body = dpg.add_group(indent=20)
+                        runtime._current_ai_message_tag = dpg.add_text(text, wrap=wrap_w, parent=msg_body)
+                        _chat_text_tags.append(runtime._current_ai_message_tag)
+                        try:
+                            dpg.bind_item_font(runtime._current_ai_message_tag, "font_chat")
+                        except Exception as e:
+                            logger.debug(f"[GUI] fallback: could not bind font_chat to streaming text: {e}")
+            else:
+                with dpg.group(horizontal=True):
+                    dpg.add_text("AI_EveryNyan:", color=_COL_ACCENT)
+                with dpg.group(indent=20):
+                    runtime._current_ai_message_tag = dpg.add_text(text, wrap=wrap_w)
+                    _chat_text_tags.append(runtime._current_ai_message_tag)
+                    try:
+                        dpg.bind_item_font(runtime._current_ai_message_tag, "font_chat")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_chat to streaming text: {e}")
         dpg.set_y_scroll("chat_area", 1e9)
 
 
@@ -234,28 +299,14 @@ def update_split_heights():
         input_reserve = 70  # fallback for first frame before layout settles
     input_reserve += 10     # spacing margin
 
-    min_bottom = 50
-    max_bottom = max(min_bottom, left_height - input_reserve - 50)
-    bottom = min(max(runtime.split_bottom_height, min_bottom), max_bottom)
-    chat_height = left_height - bottom - input_reserve
-    if chat_height < 50:
-        chat_height = 50
-        bottom = left_height - chat_height - input_reserve
-        if bottom < min_bottom:
-            bottom = min_bottom
+    # Console moved to its own CONSOLE tab: chat_area takes the whole height
+    # minus the input row and status text, so they stay visible at the bottom.
+    chat_height = max(left_height - input_reserve, 50)
     dpg.configure_item("chat_area", height=chat_height)
-    dpg.configure_item("ai_thoughts_area", height=bottom)
-    runtime.split_bottom_height = bottom
 
     global _chat_text_tags
     _chat_text_tags = [t for t in _chat_text_tags if dpg.does_item_exist(t)]
     _refresh_text_wrap_widths()
-
-
-def on_separator_drag(sender, app_data):
-    dy = app_data[1]
-    runtime.split_bottom_height -= dy
-    update_split_heights()
 
 
 def on_left_panel_resize():
@@ -272,6 +323,93 @@ def on_chat_area_resize():
 
 _IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
 _THUMB_MAX_SIZE = 280  # max thumbnail dimension in pixels
+
+# ---------------------------------------------------------------------------
+# Image avatar system.
+# Avatars are PNG files in config/character named ava_<name>.png.  The AI avatar
+# is resolved from the current character appearance set (character module's
+# current_appearance_set) at message-render time; the user avatar is ava_You.png.
+# Avatar image widgets are rendered at a height of 4 chat-font lines (font_chat is
+# 16 px => 64 px); width scales proportionally and is capped at 128 px.
+# Textures are cached per file path in _AVATAR_CACHE so each avatar loads once.
+# ---------------------------------------------------------------------------
+_AVATAR_DIR = Path("config/character")
+_AVATAR_SIZE_H = 64        # target avatar display height in pixels (4 x 16 px lines)
+_AVATAR_MAX_W = 128        # maximum avatar display width in pixels
+_AVATAR_CACHE: dict = {}   # path -> (texture_tag, scale_w, scale_h)
+
+
+def _resolve_avatar_path(name: str) -> Optional[Path]:
+    """Resolve an avatar PNG path for *name* (case-insensitive lookup)."""
+    if not name:
+        return None
+    candidates = [
+        _AVATAR_DIR / f"ava_{name}.png",
+        _AVATAR_DIR / f"ava_{name.lower()}.png",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    # Case-insensitive scan as a last resort.
+    if _AVATAR_DIR.is_dir():
+        stem = f"ava_{name}".lower()
+        for f in _AVATAR_DIR.iterdir():
+            if f.is_file() and f.stem.lower() == stem and f.suffix.lower() == ".png":
+                return f
+    return None
+
+
+def _get_avatar_texture(name: str):
+    """Load (or reuse cached) avatar texture for *name*.
+
+    Returns (texture_tag, disp_w, disp_h) or None when the avatar cannot be
+    resolved / loaded, logging a tagged fallback warning.
+    """
+    path = _resolve_avatar_path(name)
+    if path is None:
+        logger.debug(f"[GUI] fallback: avatar not found for '{name}' (no ava_{name}.png)")
+        return None
+    key = str(path.resolve())
+    cached = _AVATAR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        width, height, _channels, data = dpg.load_image(str(path))
+    except Exception as e:
+        logger.warning(f"[GUI] fallback: avatar not loaded for '{name}' ({path}): {e}")
+        return None
+    tex_tag = f"ava_tex_{uuid.uuid4().hex[:8]}"
+    try:
+        dpg.add_static_texture(
+            width, height, data,
+            tag=tex_tag,
+            parent="chat_texture_registry",
+        )
+    except Exception as e:
+        logger.warning(f"[GUI] fallback: avatar not loaded for '{name}' (texture register failed: {e})")
+        return None
+    ratio = _AVATAR_SIZE_H / height
+    disp_w = min(int(width * ratio), _AVATAR_MAX_W)
+    if disp_w == 0:
+        disp_w = 1
+    disp_h = _AVATAR_SIZE_H
+    entry = (tex_tag, disp_w, disp_h)
+    _AVATAR_CACHE[key] = entry
+    return entry
+
+
+def _get_avatar_for_sender(sender: str):
+    """Resolve the avatar texture for a chat message sender.
+
+    The AI avatar is resolved from character.current_appearance_set
+    (the active appearance set name).  The user avatar is ava_You.png.
+    Returns (texture_tag, disp_w, disp_h) or None when unavailable.
+    """
+    if sender == "You":
+        avatar_name = "You"
+    else:
+        avatar_name = getattr(character, "current_appearance_set", None) or "EveryNyan"
+    return _get_avatar_texture(avatar_name)
 
 
 def _parse_image_paths(text: str) -> Tuple[str, list]:
@@ -426,21 +564,54 @@ def add_chat_message(sender: str, text: str, color: tuple):
 
     Automatically detects image file paths in the text and displays
     them as clickable thumbnails below the text content.
+
+    When an avatar PNG exists for the sender, the layout is a horizontal
+    group: [avatar image widget] + [vertical group: sender label + message
+    body + image thumbnails].  When no avatar resolves/loads, the original
+    layout (sender label + indented text) is preserved unchanged.
     """
     wrap_w = get_chat_wrap_width()
     dpg.set_y_scroll("chat_area", 1e9)
 
     clean_text, image_paths = _parse_image_paths(text)
 
+    avatar = _get_avatar_for_sender(sender)
+
     with dpg.group(parent="chat_area", horizontal=False):
-        with dpg.group(horizontal=True):
-            dpg.add_text(f"{sender}:", color=color)
-        with dpg.group(indent=20) as msg_body:
-            if clean_text.strip():
-                tag = dpg.add_text(clean_text, wrap=wrap_w)
-                _chat_text_tags.append(tag)
-            for img_path in image_paths:
-                _add_image_thumbnail(parent=msg_body, image_path=img_path)
+        if avatar is not None:
+            tex_tag, av_w, av_h = avatar
+            with dpg.group(horizontal=True):
+                dpg.add_image(
+                    tex_tag,
+                    tag=f"ava_{uuid.uuid4().hex[:8]}",
+                    width=av_w,
+                    height=av_h,
+                )
+                with dpg.group():
+                    dpg.add_text(f"{sender}:", color=color)
+                    msg_body = dpg.add_group(indent=20)
+                    if clean_text.strip():
+                        tag = dpg.add_text(clean_text, wrap=wrap_w - 150, parent=msg_body)
+                        _chat_text_tags.append(tag)
+                        try:
+                            dpg.bind_item_font(tag, "font_chat")
+                        except Exception as e:
+                            logger.debug(f"[GUI] fallback: could not bind font_chat to chat text: {e}")
+                    for img_path in image_paths:
+                        _add_image_thumbnail(parent=msg_body, image_path=img_path)
+        else:
+            with dpg.group(horizontal=True):
+                dpg.add_text(f"{sender}:", color=color)
+            with dpg.group(indent=20) as msg_body:
+                if clean_text.strip():
+                    tag = dpg.add_text(clean_text, wrap=wrap_w)
+                    _chat_text_tags.append(tag)
+                    try:
+                        dpg.bind_item_font(tag, "font_chat")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_chat to chat text: {e}")
+                for img_path in image_paths:
+                    _add_image_thumbnail(parent=msg_body, image_path=img_path)
         dpg.add_spacer(height=5)
     dpg.set_y_scroll("chat_area", 1e9)
 
@@ -467,24 +638,15 @@ def find_available_font() -> Optional[str]:
 
 def on_chat_mode_changed(sender, app_data):
     runtime.runtime_chat_mode = app_data
-    if app_data == "ollama":
-        runtime.runtime_chat_params.update({
-            "base_url": runtime.settings.ollama.base_url,
-            "api_key": runtime.settings.ollama.api_key,
-            "model": runtime.settings.ollama.chat_model,
-            "temperature": runtime.settings.ollama.temperature,
-            "max_tokens": runtime.settings.ollama.max_tokens,
-            "timeout": runtime.settings.ollama.timeout,
-        })
-    else:
-        runtime.runtime_chat_params.update({
-            "base_url": runtime.settings.llama.base_url,
-            "api_key": runtime.settings.llama.api_key,
-            "model": runtime.settings.llama.chat_model,
-            "temperature": runtime.settings.llama.temperature,
-            "max_tokens": runtime.settings.llama.max_tokens,
-            "timeout": runtime.settings.llama.timeout,
-        })
+    cfg = runtime.chat_settings_for_mode(app_data)
+    runtime.runtime_chat_params.update({
+        "base_url": cfg.base_url,
+        "api_key": cfg.api_key,
+        "model": cfg.chat_model,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+        "timeout": cfg.timeout,
+    })
     dpg.set_value("chat_temp", runtime.runtime_chat_params["temperature"])
     dpg.set_value("chat_max_tokens", runtime.runtime_chat_params["max_tokens"])
     dpg.set_value("chat_timeout", runtime.runtime_chat_params["timeout"])
@@ -514,12 +676,9 @@ def on_embed_mode_changed(sender, app_data):
 
 def refresh_models_list():
     backend = dpg.get_value("chat_mode_radio")
-    if backend == "ollama":
-        url = runtime.settings.ollama.base_url
-        api_key = runtime.settings.ollama.api_key
-    else:
-        url = runtime.settings.llama.base_url
-        api_key = runtime.settings.llama.api_key
+    cfg = runtime.chat_settings_for_mode(backend)
+    url = cfg.base_url
+    api_key = cfg.api_key
 
     models = fetch_models_from_backend(backend, url, api_key)
     if models:
@@ -716,10 +875,12 @@ def _on_comfyui_debug_generate(sender, app_data):
         global _comfyui_debug_generating
         try:
             server = runtime.settings.comfyui.server
-            wf_path = Path(runtime.settings.comfyui.workflow_dir) / "default.json"
-            if not wf_path.exists():
-                add_ai_thought(f"[ComfyUI DEBUG] Workflow not found: {wf_path}", (255, 100, 100))
+            wf_dir = Path(runtime.settings.comfyui.workflow_dir)
+            candidates = sorted(wf_dir.glob("*.json")) if wf_dir.is_dir() else []
+            if not candidates:
+                add_ai_thought(f"[ComfyUI DEBUG] fallback: no workflow files in {wf_dir}", _COL_ERR)
                 return
+            wf_path = candidates[0]
 
             workflow = _json.loads(wf_path.read_text(encoding="utf-8"))
 
@@ -1023,20 +1184,61 @@ def setup_gui():
         tag="comfyui_preview_tex", parent="chat_texture_registry",
     )
     font_path = find_available_font()
-    if font_path:
+    try:
         with dpg.font_registry():
-            with dpg.font(font_path, 16) as main_font:
-                pass
-        dpg.bind_font(main_font)
+            header_font = _FONTS_DIR / "ModeSevenBETAVHS20212.ttf"
+            body_font = _FONTS_DIR / "ModeSevenBETAVHS.ttf"
+            chat_font = _FONTS_DIR / "VCR_OSD_Mono_RUS-VHS.ttf"
+            if header_font.is_file():
+                dpg.add_font(str(header_font), 22, tag="font_header")
+            if body_font.is_file():
+                dpg.add_font(str(body_font), 16, tag="font_body")
+            if chat_font.is_file():
+                with dpg.font(str(chat_font), 16, tag="font_chat"):
+                    pass
+        if dpg.does_item_exist("font_body"):
+            dpg.bind_font("font_body")
+            logger.info("[GUI] Registered fonts: font_header, font_body (default), font_chat")
+        else:
+            raise FileNotFoundError("font_body could not be created")
+    except Exception as e:
+        logger.warning(
+            f"[GUI] fallback: custom font registration failed ({e}), "
+            f"falling back to find_available_font()"
+        )
+        if font_path:
+            with dpg.font_registry():
+                with dpg.font(font_path, 16) as main_font:
+                    pass
+            dpg.bind_font(main_font)
     dpg.create_viewport(title=runtime.settings.gui.title, width=runtime.settings.gui.width, height=runtime.settings.gui.height, resizable=True)
-    if runtime.settings.gui.theme == "dark":
-        with dpg.theme() as dark_theme:
-            with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (25,25,35))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (40,40,60))
-                dpg.add_theme_color(dpg.mvThemeCol_Header, (50,50,80))
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (220,220,220))
-        dpg.bind_theme(dark_theme)
+    logger.info("[GUI] Theme active: %s (CrisTical dark palette applied)", runtime.settings.gui.theme)
+    with dpg.theme() as global_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (25, 25, 35))
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (20, 22, 26))
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (45, 55, 70))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (65, 80, 100))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (85, 100, 120))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (40, 42, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (220, 220, 220))
+            dpg.add_theme_color(dpg.mvThemeCol_Header, (50, 50, 80))
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 4)
+        dpg.bind_theme(global_theme)
+
+    # Send (green) and Reset (red) button themes
+    with dpg.theme(tag="button_theme_send"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (40, 70, 40))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (50, 120, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 90, 30))
+    with dpg.theme(tag="button_theme_reset"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (70, 40, 40))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (120, 50, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 30, 30))
 
     # Image button theme — transparent background, subtle hover border
     with dpg.theme(tag="image_button_theme"):
@@ -1052,99 +1254,141 @@ def setup_gui():
     with dpg.window(label="Chat", tag="main_window", no_title_bar=True, no_move=True, no_resize=False, no_scrollbar=True):
         dpg.set_primary_window("main_window", True)
 
-        with dpg.group(horizontal=True):
-            with dpg.child_window(tag="left_panel", width=-300, border=False, no_scrollbar=True):
-                with dpg.child_window(tag="chat_area", height=-200, border=False):
-                    if runtime.memory_manager:
-                        history = runtime.memory_manager.get_recent_history(limit=50)
-                        for msg in history:
-                            color = (100,200,255) if msg['role'] == 'user' else (255,200,100)
-                            sender = "You" if msg['role'] == 'user' else "AI_EveryNyan"
-                            add_chat_message(sender, msg['content'], color)
-                    else:
-                        dpg.add_text("Welcome to AI_EveryNyan!", color=(150,150,200))
+        with dpg.tab_bar(tag="main_tab_bar"):
+            # -------------------------------------------------------------------
+            # CHAT TAB — chat area, ComfyUI progress, input row.
+            # -------------------------------------------------------------------
+            with dpg.tab(label="CHAT", tag="chat_tab"):
+                with dpg.child_window(tag="left_panel", width=-1, border=False, no_scrollbar=True):
+                    with dpg.child_window(tag="chat_area", height=-200, border=False):
+                        if runtime.memory_manager:
+                            history = runtime.memory_manager.get_recent_history(limit=50)
+                            for msg in history:
+                                color = _COL_ACCENT if msg['role'] == 'assistant' else _COL_ACCENT_SOFT
+                                sender = "YOU" if msg['role'] == 'user' else "AI_EVERYNYAN"
+                                add_chat_message(sender, msg['content'], color)
+                        else:
+                            dpg.add_text("WELCOME TO AI_EVERYNYAN!", color=_COL_DIM)
 
-                with dpg.child_window(tag="ai_thoughts_area", height=-1, label="[SYSTEM] LOG", border=True):
-                    dpg.add_text("[SYSTEM] STATUS: Idle", tag="thoughts_placeholder", color=(100,100,100))
+                    with dpg.group(tag="comfyui_progress_group", show=False):
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("COMFYUI:", color=_COL_ACCENT)
+                            dpg.add_progress_bar(tag="comfyui_progress_bar", width=-1, height=14, default_value=0.0, overlay="")
 
-                with dpg.group(tag="comfyui_progress_group", show=False):
+                    with dpg.group(horizontal=True, tag="input_row"):
+                        dpg.add_input_text(tag="user_input", width=-220, hint="Type your message...", on_enter=True, callback=on_send_message)
+                        try:
+                            dpg.bind_item_font("user_input", "font_chat")
+                        except Exception as e:
+                            logger.debug(f"[GUI] fallback: could not bind font_chat to user_input: {e}")
+                        send_btn = dpg.add_button(label="SEND", callback=on_send_message)
+                        dpg.bind_item_theme(send_btn, "button_theme_send")
+                        mem_btn = dpg.add_button(label="MEMORY REPORT", callback=on_memory_report)
+                        dpg.bind_item_theme(mem_btn, "button_theme_reset")
+                    dpg.add_text("", tag="status_text", color=_COL_DIM)
+
+                    with dpg.item_handler_registry(tag="chat_resize_handler"):
+                        dpg.add_item_resize_handler(callback=on_chat_area_resize)
+                    dpg.bind_item_handler_registry("chat_area", "chat_resize_handler")
+
+                    with dpg.item_handler_registry(tag="left_panel_resize_handler"):
+                        dpg.add_item_resize_handler(callback=on_left_panel_resize)
+                    dpg.bind_item_handler_registry("left_panel", "left_panel_resize_handler")
+
+            # -------------------------------------------------------------------
+            # CONSOLE TAB — AI system log ([SYSTEM] LOG), full tab area.
+            # -------------------------------------------------------------------
+            with dpg.tab(label="CONSOLE", tag="console_tab"):
+                with dpg.child_window(tag="ai_thoughts_area", height=-1, label="[SYSTEM] LOG", border=False):
+                    dpg.add_text("[SYSTEM] STATUS: IDLE", tag="thoughts_placeholder", color=_COL_IDLE)
+
+            # -------------------------------------------------------------------
+            # SETTINGS TAB — chat backend, embedding, character, ComfyUI panels.
+            # -------------------------------------------------------------------
+            with dpg.tab(label="SETTINGS", tag="settings_tab"):
+                with dpg.child_window(tag="control_panel", width=-1, border=False):
+                    hdr_chat = dpg.add_text("CHAT BACKEND", color=_COL_ACCENT)
+                    try:
+                        dpg.bind_item_font(hdr_chat, "font_header")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_header to CHAT BACKEND: {e}")
+                    dpg.add_radio_button(tag="chat_mode_radio", items=["ollama", "llama", "openai"], default_value=runtime.runtime_chat_mode, horizontal=True, callback=on_chat_mode_changed)
+
+                    dpg.add_text(f"Ollama URL: {runtime.settings.ollama.base_url}", color=_COL_DIM)
+                    dpg.add_text(f"LLaMA URL: {runtime.settings.llama.base_url}", color=_COL_DIM)
+
                     with dpg.group(horizontal=True):
-                        dpg.add_text("ComfyUI:", color=(255, 200, 100))
-                        dpg.add_progress_bar(tag="comfyui_progress_bar", width=-1, height=14, default_value=0.0, overlay="")
+                        dpg.add_combo(tag="chat_model_combo", label="Model", width=340, default_value=runtime.runtime_chat_params.get("model", ""), callback=lambda s,a: dpg.set_value("chat_model_hidden", a))
+                        dpg.add_button(label="↻", tag="refresh_models_btn", callback=lambda: refresh_models_list())
+                    dpg.add_input_text(tag="chat_model_hidden", default_value=runtime.runtime_chat_params.get("model", ""), show=False)
 
-                with dpg.group(horizontal=True, tag="input_row"):
-                    dpg.add_input_text(tag="user_input", width=-220, hint="Type your message...", on_enter=True, callback=on_send_message)
-                    dpg.add_button(label="Send", callback=on_send_message, width=70)
-                    dpg.add_button(label="Memory Report", callback=on_memory_report, width=130)
-                dpg.add_text("", tag="status_text", color=(100,100,100))
+                    dpg.add_input_float(tag="chat_temp", label="Temperature", default_value=runtime.runtime_chat_params.get("temperature", 0.7), step=0.05, min_value=0.0, max_value=2.0)
+                    dpg.add_input_int(tag="chat_max_tokens", label="Max tokens", default_value=runtime.runtime_chat_params.get("max_tokens", 2048), step=256, min_value=1)
+                    dpg.add_input_int(tag="chat_timeout", label="Timeout (s)", default_value=runtime.runtime_chat_params.get("timeout", 120), step=10, min_value=10)
+                    dpg.add_button(label="Apply Chat Settings", callback=apply_chat_from_ui)
+                    dpg.add_spacer(height=10)
 
-                with dpg.item_handler_registry(tag="chat_resize_handler"):
-                    dpg.add_item_resize_handler(callback=on_chat_area_resize)
-                dpg.bind_item_handler_registry("chat_area", "chat_resize_handler")
+                    hdr_embed = dpg.add_text("EMBEDDING BACKEND", color=_COL_ACCENT)
+                    try:
+                        dpg.bind_item_font(hdr_embed, "font_header")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_header to EMBEDDING BACKEND: {e}")
+                    dpg.add_radio_button(tag="embed_mode_radio", items=["ollama", "llama"], default_value=runtime.runtime_embed_mode, horizontal=True, callback=on_embed_mode_changed)
+                    dpg.add_text(f"Ollama URL: {runtime.settings.ollama.base_url}", color=_COL_DIM)
+                    dpg.add_text(f"Embedding model: {runtime.settings.ollama.embedding_model}", color=_COL_DIM)
+                    dpg.add_button(label="Apply Embedding Settings", callback=apply_embed_from_ui)
+                    dpg.add_spacer(height=10)
 
-                with dpg.item_handler_registry(tag="left_panel_resize_handler"):
-                    dpg.add_item_resize_handler(callback=on_left_panel_resize)
-                dpg.bind_item_handler_registry("left_panel", "left_panel_resize_handler")
-
-            with dpg.child_window(tag="control_panel", width=330, border=True, label="Control Panel", horizontal_scrollbar=True):
-                dpg.add_text("Chat Backend", color=(200,200,255))
-                dpg.add_radio_button(tag="chat_mode_radio", items=["ollama", "llama"], default_value=runtime.runtime_chat_mode, horizontal=True, callback=on_chat_mode_changed)
-
-                dpg.add_text(f"Ollama URL: {runtime.settings.ollama.base_url}", color=(150,150,200), wrap=270)
-                dpg.add_text(f"LLaMA URL: {runtime.settings.llama.base_url}", color=(150,150,200), wrap=270)
-
-                with dpg.group(horizontal=True):
-                    dpg.add_combo(tag="chat_model_combo", label="Model", width=-50, default_value=runtime.runtime_chat_params.get("model", ""), callback=lambda s,a: dpg.set_value("chat_model_hidden", a))
-                    dpg.add_button(label="↻", tag="refresh_models_btn", callback=lambda: refresh_models_list(), width=40)
-                dpg.add_input_text(tag="chat_model_hidden", default_value=runtime.runtime_chat_params.get("model", ""), show=False)
-
-                dpg.add_input_float(tag="chat_temp", label="Temperature", default_value=runtime.runtime_chat_params.get("temperature", 0.7), step=0.05, min_value=0.0, max_value=2.0)
-                dpg.add_input_int(tag="chat_max_tokens", label="Max tokens", default_value=runtime.runtime_chat_params.get("max_tokens", 2048), step=256, min_value=1)
-                dpg.add_input_int(tag="chat_timeout", label="Timeout (s)", default_value=runtime.runtime_chat_params.get("timeout", 120), step=10, min_value=10)
-                dpg.add_button(label="Apply Chat Settings", callback=apply_chat_from_ui)
-                dpg.add_spacer(height=10)
-
-                dpg.add_text("Embedding Backend", color=(200,255,200))
-                dpg.add_radio_button(tag="embed_mode_radio", items=["ollama", "llama"], default_value=runtime.runtime_embed_mode, horizontal=True, callback=on_embed_mode_changed)
-                dpg.add_text(f"Ollama URL: {runtime.settings.ollama.base_url}", color=(150,150,200), wrap=270)
-                dpg.add_text(f"Embedding model: {runtime.settings.ollama.embedding_model}", color=(150,150,200), wrap=270)
-                dpg.add_button(label="Apply Embedding Settings", callback=apply_embed_from_ui)
-                dpg.add_spacer(height=10)
-
-                dpg.add_text("Character Appearance", color=(255,200,100))
-                with dpg.group(horizontal=True):
-                    dpg.add_combo(tag="character_combo", label="Appearance", width=-50, callback=on_character_selected)
-                    dpg.add_button(label="Update", tag="update_char_list_btn", callback=lambda: refresh_character_list(), width=40)
-                dpg.add_spacer(height=5)
-
-                dpg.add_button(label="Reset to settings.yaml", callback=lambda: reset_to_yaml_defaults_and_update_ui())
-                dpg.add_spacer(height=5)
-                dpg.add_text("Note: Changing embedding model requires same vector dimension.", color=(200,150,100), wrap=270)
-
-                with dpg.group(tag="comfyui_preview_group", show=False):
-                    dpg.add_separator()
+                    hdr_char = dpg.add_text("CHARACTER APPEARANCE", color=_COL_ACCENT)
+                    try:
+                        dpg.bind_item_font(hdr_char, "font_header")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_header to CHARACTER APPEARANCE: {e}")
+                    with dpg.group(horizontal=True):
+                        dpg.add_combo(tag="character_combo", label="Appearance", width=340, callback=on_character_selected)
+                        dpg.add_button(label="Update", tag="update_char_list_btn", callback=lambda: refresh_character_list())
                     dpg.add_spacer(height=5)
-                    dpg.add_text("ComfyUI Generation", color=(255, 200, 100))
-                    dpg.add_image("comfyui_preview_tex", tag="comfyui_preview_image", width=_COMFYUI_PREVIEW_SIZE, height=_COMFYUI_PREVIEW_SIZE)
-                    dpg.add_spacer(height=5)
-                    dpg.add_button(label="Cancel & Free Memory", tag="comfyui_cancel_btn", callback=_on_comfyui_cancel, width=-1)
 
-                with dpg.group(tag="comfyui_status_group"):
-                    dpg.add_separator()
+                    reset_btn = dpg.add_button(label="RESET TO settings.yaml", callback=lambda: reset_to_yaml_defaults_and_update_ui())
+                    dpg.bind_item_theme(reset_btn, "button_theme_reset")
                     dpg.add_spacer(height=5)
-                    dpg.add_text("ComfyUI: Disconnected", tag="comfyui_conn_text", color=(200, 100, 100))
+                    dpg.add_text("Note: Changing embedding model requires same vector dimension.", color=_COL_WARN)
 
-                if runtime.settings.debug:
-                    with dpg.group(tag="comfyui_debug_group"):
+                    hdr_comfy = dpg.add_text("COMFYUI", color=_COL_ACCENT)
+                    try:
+                        dpg.bind_item_font(hdr_comfy, "font_header")
+                    except Exception as e:
+                        logger.debug(f"[GUI] fallback: could not bind font_header to COMFYUI: {e}")
+
+                    with dpg.group(tag="comfyui_preview_group", show=False):
                         dpg.add_separator()
                         dpg.add_spacer(height=5)
-                        dpg.add_text("ComfyUI DEBUG", color=(255, 100, 100))
-                        dpg.add_button(
-                            label="Generate Test Image",
-                            tag="comfyui_debug_gen_btn",
-                            callback=_on_comfyui_debug_generate,
-                            width=-1,
-                        )
+                        dpg.add_text("ComfyUI Generation", color=_COL_ACCENT)
+                        dpg.add_image("comfyui_preview_tex", tag="comfyui_preview_image", width=_COMFYUI_PREVIEW_SIZE, height=_COMFYUI_PREVIEW_SIZE)
+                        dpg.add_spacer(height=5)
+                        dpg.add_button(label="Cancel & Free Memory", tag="comfyui_cancel_btn", callback=_on_comfyui_cancel, width=-1)
+
+                    with dpg.group(tag="comfyui_status_group"):
+                        dpg.add_separator()
+                        dpg.add_spacer(height=5)
+                        dpg.add_text("ComfyUI: Disconnected", tag="comfyui_conn_text", color=_COL_ERR)
+
+                    if runtime.settings.debug:
+                        with dpg.group(tag="comfyui_debug_group"):
+                            dpg.add_separator()
+                            dpg.add_spacer(height=5)
+                            dpg.add_text("ComfyUI DEBUG", color=_COL_ERR)
+                            dpg.add_button(
+                                label="Generate Test Image",
+                                tag="comfyui_debug_gen_btn",
+                                callback=_on_comfyui_debug_generate,
+                                width=-1,
+                            )
+
+    try:
+        dpg.bind_item_font("main_tab_bar", "font_body")
+    except Exception as e:
+        logger.debug(f"[GUI] fallback: could not bind font_body to tab bar: {e}")
 
     dpg.setup_dearpygui()
     dpg.show_viewport()

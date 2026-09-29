@@ -3,9 +3,14 @@ Character initialization, projection management, and system prompt builder for A
 Loads base persona, JSON appearance files, and manages reprojection persistence.
 
 /src/character.py
-Version:     0.17.6
+Version:     0.18.1
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-09-29
+
+Patch Notes v0.18.1 (Soror L'.L'.):
+  [+] build_system_prompt(): injects current local time (<time> block) - the
+      model now has a reference point to reason about message timestamps and
+      how long ago past conversations happened.
 
 Patch Notes v0.18.0 (by pytraveler):
   [+] Extracted from main.py: init_character(), build_system_prompt().
@@ -122,7 +127,18 @@ def build_system_prompt() -> str:
     else:
         visual_ref = f"Appearance of {current_persona_name}"
 
+    from datetime import datetime as _dt
+
+    now_str = _dt.now().astimezone().strftime("%A, %Y-%m-%d %H:%M (%z)")
+
     return f"""{character_base.prompt}
+
+<time>
+Current local time: {now_str}
+Messages in the dialogue history may carry a "[YYYY-MM-DD HH:MM]" prefix - that
+is when each message was sent. Use it (and the current time above) to reason
+about how recent or how long ago past events and conversations happened.
+</time>
 
 <visual_reference>
 {visual_ref}

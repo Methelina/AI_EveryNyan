@@ -4,9 +4,35 @@ AI_EveryNyan - DearPyGui Chat with LangChain + Qdrant RAG + DuckDB History
 Modular Character System + Smart Context Management + Structured Diary Metadata
 
 src/main.py
-Version:     0.17.8
+Version:     0.17.10
 Author:      Soror L.'.L.'.
-Updated:     2026-05-05
+Updated:     2026-09-29
+
+Patch Notes v0.17.10 (Soror L'.L'.):
+  [FIX] Dead-model handling: synthetic error replies ("Sorry, I encountered
+      an error...", timeouts) are no longer RETURNED as assistant messages -
+      they were being persisted to DuckDB/Qdrant/session_context as fake
+      memories. process_message now raises GenerationError; the GUI shows the
+      text but skips save_to_memory.
+  [+] 410/retired/missing-model errors get a specific remedy message
+      (update chat_model in settings.yaml) + [LLM] fallback log.
+  [+] 429/rate-limit errors: Kilo-style silent outer retry ladder
+      (RATE_LIMIT_DELAYS = 10/30/60s, ~100s patience) paced for
+      per-minute provider quotas; SDK max_retries kept short so quota windows
+      are not burned. Chat is never shown intermediate failures.
+  [+] Fail-fast cooldown: after ladder exhaustion the backend is marked
+      unhealthy (runtime.mark_llm_cooldown, 300s) - subsequent messages error
+      INSTANTLY instead of re-entering the ladder, so the GUI is never trapped;
+      changing chat settings resets the cooldown immediately.
+  [+] chat_mode "openai": startup params resolve via
+      runtime.chat_settings_for_mode() (ollama / llama / openai sections);
+      ChatOpenAI paths accept the openai mode alongside ollama.
+
+Patch Notes v0.17.9 (Soror L'.L'.):
+  [+] Dialogue history messages with a timestamp get a "[YYYY-MM-DD HH:MM]"
+      prefix at prompt assembly (format_timestamp) - paired with the <time>
+      block in the system prompt, the model can reason about when each
+      message was sent and how long ago past conversations happened.
 
 Patch Notes v0.17.8 (by pytraveler):
   [+] ComfyUI daemon integration: initialize and start ComfyUIDaemon at startup
@@ -35,6 +61,7 @@ Patch Notes v0.17.6 (by pytraveler):
 """
 
 import sys
+import re
 import asyncio
 import logging
 import signal
@@ -52,6 +79,7 @@ from openai import BadRequestError, APITimeoutError
 import logging_exceptions
 import runtime
 from config import AppSettings
+from memory_manager import format_timestamp
 from runtime import (
     submit_to_async,
     init_components,
@@ -96,6 +124,50 @@ from logger import logger
 # ============================================================================
 
 _IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+
+
+class GenerationError(Exception):
+    """Synthetic failure reply (dead model, timeout, API error).
+
+    Raised instead of returning a fake assistant message, so the caller can
+    show the text to the user WITHOUT persisting it to chat history / RAG -
+    error texts must never become 'memories'.
+    """
+    pass
+
+
+def _model_unavailable_hint(error_str: str) -> str:
+    """User-facing remedy when the configured model is dead (404/410/retired)."""
+    model = getattr(runtime.settings, "chat_mode", None)
+    try:
+        model = runtime.settings.get_chat_config().chat_model
+    except Exception:
+        pass
+    logger.warning(
+        "[LLM] fallback: chat model '%s' is unavailable (retired/missing). "
+        "Remedy: update chat_model in config\\settings.yaml and restart",
+        model,
+    )
+    return (
+        f"My language model ('{model}') is currently unavailable "
+        f"(the server reported it as retired or missing). "
+        f"Please update chat_model in config/settings.yaml to an installed model and restart."
+    )
+
+
+_TIMESTAMP_ECHO_RE = re.compile(r"^\s*(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*)+")
+
+
+def _strip_timestamp_echo(text: str) -> str:
+    """Models sometimes COPY the "[YYYY-MM-DD HH:MM]" prefixes we add to
+    history entries back into their reply (worst case doubled). Strip any
+    leading timestamp prefixes from the reply before it is shown or saved."""
+    return _TIMESTAMP_ECHO_RE.sub("", text, count=1)
+    return (
+        f"My language model ('{model}') is currently unavailable "
+        f"(the server reported it as retired or missing). "
+        f"Please update chat_model in config/settings.yaml to an installed model and restart me."
+    )
 
 
 def _extract_image_paths(content: str) -> list[str]:
@@ -148,23 +220,37 @@ async def process_message(user_text: str) -> str:
         )
 
         for msg in recent:
+            # Timestamped messages carry a "[YYYY-MM-DD HH:MM]" prefix so the
+            # model can reason about when each message was sent (paired with
+            # the current time in the <time> system block).
+            content = msg["content"]
+            ts_prefix = format_timestamp(msg.get("timestamp"))
+            if ts_prefix:
+                content = f"{ts_prefix} {content}"
             if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
+                messages.append(HumanMessage(content=content))
             elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
+                messages.append(AIMessage(content=content))
 
         messages.append(HumanMessage(content=user_text))
 
         content = ""
 
         if runtime.react_agent:
+            if runtime.agent_needs_rebuild:
+                # Chat settings changed moments ago: the scheduled async
+                # rebuild may not have run yet - without this, the OLD model
+                # answers the first messages after a model switch.
+                logger.info("[MCP] Agent rebuild pending - rebuilding inline (stale model guard)")
+                from runtime import _recreate_mcp_agent
+                await _recreate_mcp_agent()
             add_ai_thought("[MCP] Using react agent with tools", (100, 200, 255))
             try:
                 result = await runtime.react_agent.ainvoke({"messages": messages})
             except Exception as agent_err:
                 logger.error(f"MCP agent execution failed: {agent_err}", exc_info=True)
                 add_ai_thought(f"[MCP] Agent error: {agent_err}. Falling back to direct LLM.", (255, 100, 100))
-                if runtime.runtime_chat_mode == "ollama":
+                if runtime.runtime_chat_mode in ("ollama", "openai"):
                     response = await runtime.llm.ainvoke(messages)
                     content = response.content
                 else:
@@ -176,7 +262,7 @@ async def process_message(user_text: str) -> str:
                             update_ai_message_streaming(full_content)
                     content = full_content
                 finalize_ai_message_streaming()
-                return content
+                return _strip_timestamp_echo(content)
 
             collected_image_paths: list[str] = []
             for msg in result["messages"]:
@@ -214,7 +300,7 @@ async def process_message(user_text: str) -> str:
                 )
             if reasoning:
                 add_ai_thought(f"[REASONING]\n{reasoning}", (180, 180, 150))
-        elif runtime.runtime_chat_mode == "ollama":
+        elif runtime.runtime_chat_mode in ("ollama", "openai"):
             response = await runtime.llm.ainvoke(messages)
             content = response.content
             reasoning = response.response_metadata.get("reasoning_content", "") or ""
@@ -234,29 +320,93 @@ async def process_message(user_text: str) -> str:
                 add_ai_thought(f"[REASONING]\n{full_reasoning}", (180,180,150))
             content = full_content
 
+        # Models sometimes copy the "[...]" timestamp prefixes from history
+        # entries back into their reply - never let those leak into the
+        # response or the stored history.
+        content = _strip_timestamp_echo(content)
+
         return content
 
-    try:
-        return await attempt_generation()
-    except (BadRequestError, APITimeoutError, TimeoutError) as e:
-        error_str = str(e).lower()
-        if "context length" in error_str or "exceeds" in error_str:
-            add_ai_thought(f"[WARN] CONTEXT OVERFLOW: {len(runtime.session_context)} messages", (255,150,100))
-            await dump_context_to_memory()
-            if runtime.memory_manager:
-                fresh = runtime.memory_manager.get_recent_history(limit=runtime.settings.context.max_history_messages)
-                runtime.session_context.extend(fresh)
-                add_ai_thought(f"[CTX] Rehydrated: loaded {len(fresh)} messages", (150,255,150))
+    # Rate-limit retry ladder: Kilo-style silent backoff - the chat is never
+    # shown intermediate failures, the console gets one timer line per retry.
+    # Steps sized for per-MINUTE provider quotas (Mistral free tier): the SDK
+    # gives up quickly (max_retries=2), pacing is done by this loop.
+    RATE_LIMIT_DELAYS = (10, 30, 60)  # seconds; ~100s total patience
+
+    # Fast-fail cooldown: once the ladder is exhausted, subsequent messages
+    # error INSTANTLY (no new ladders) until the cooldown expires or the user
+    # changes chat settings - so a dead backend never traps the GUI.
+    LLM_COOLDOWN_SEC = 300
+
+    remaining = runtime.llm_cooldown_remaining()
+    if remaining:
+        raise GenerationError(
+            f"My model backend failed repeatedly and is in cooldown for another "
+            f"~{remaining}s. Change chat_model / backend in settings (applies "
+            f"immediately) - or wait and send again."
+        )
+
+    def _classify_llm_error(e: Exception) -> str:
+        s = str(e).lower()
+        if isinstance(e, (APITimeoutError, TimeoutError)) or "timed out" in s:
+            return "timeout"
+        if "context length" in s or "exceeds" in s and "context" in s:
+            return "context_overflow"
+        if "429" in s or "rate limit" in s:
+            return "rate_limit"
+        if "410" in s or "retired" in s or "does not exist" in s or "not found" in s:
+            return "model_unavailable"
+        return "generic"
+
+    rate_attempt = 0
+    while True:
+        try:
             return await attempt_generation()
-        elif "timeout" in error_str:
-            add_ai_thought("[WARN] LLM request timed out. Please try again with a shorter message.", (255,200,100))
-            return "I'm sorry, I took too long to think. Could you please repeat your question or make it shorter?"
-        else:
+        except GenerationError:
+            raise
+        except Exception as e:
+            kind = _classify_llm_error(e)
+
+            if kind == "context_overflow":
+                add_ai_thought(f"[WARN] CONTEXT OVERFLOW: {len(runtime.session_context)} messages", (255,150,100))
+                await dump_context_to_memory()
+                if runtime.memory_manager:
+                    fresh = runtime.memory_manager.get_recent_history(limit=runtime.settings.context.max_history_messages)
+                    runtime.session_context.extend(fresh)
+                    add_ai_thought(f"[CTX] Rehydrated: loaded {len(fresh)} messages", (150,255,150))
+                continue
+
+            if kind == "rate_limit" and rate_attempt < len(RATE_LIMIT_DELAYS):
+                wait = RATE_LIMIT_DELAYS[rate_attempt]
+                rate_attempt += 1
+                logger.info(
+                    "[LLM] Rate limited - silent retry %d/%d in %ds (model='%s')",
+                    rate_attempt, len(RATE_LIMIT_DELAYS), wait,
+                    runtime.settings.get_chat_config().chat_model,
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            if kind == "rate_limit":
+                logger.warning("[LLM] fallback: still rate limited after %d silent retries", len(RATE_LIMIT_DELAYS))
+                runtime.mark_llm_cooldown(LLM_COOLDOWN_SEC)
+                raise GenerationError(
+                    "I'm being rate-limited by my model provider and my retries "
+                    "ran out. I'll answer normally once the limit resets - "
+                    "or switch chat_model / backend in settings to reach me right away."
+                )
+
+            if kind == "timeout":
+                add_ai_thought("[WARN] LLM request timed out. Please try again with a shorter message.", (255,200,100))
+                raise GenerationError(
+                    "I'm sorry, I took too long to think. Could you please repeat your question or make it shorter?"
+                )
+
+            if kind == "model_unavailable":
+                raise GenerationError(_model_unavailable_hint(str(e)))
+
             logger.error(f"LLM request failed: {e}")
-            return f"Sorry, I encountered an error: {e}"
-    except Exception as e:
-        logger.error(f"LLM request failed: {e}")
-        return f"Sorry, I encountered an error: {e}"
+            raise GenerationError(f"Sorry, I encountered an error: {e}")
 
 
 # ============================================================================
@@ -312,24 +462,16 @@ def main():
 
     runtime.runtime_chat_mode = runtime.settings.chat_mode
     runtime.runtime_embed_mode = runtime.settings.embedding_mode
-    if runtime.runtime_chat_mode == "ollama":
-        runtime.runtime_chat_params = {
-            "model": runtime.settings.ollama.chat_model,
-            "base_url": runtime.settings.ollama.base_url,
-            "api_key": runtime.settings.ollama.api_key,
-            "temperature": runtime.settings.ollama.temperature,
-            "max_tokens": runtime.settings.ollama.max_tokens,
-            "timeout": runtime.settings.ollama.timeout,
-        }
-    else:
-        runtime.runtime_chat_params = {
-            "model": runtime.settings.llama.chat_model,
-            "base_url": runtime.settings.llama.base_url,
-            "api_key": runtime.settings.llama.api_key,
-            "temperature": runtime.settings.llama.temperature,
-            "max_tokens": runtime.settings.llama.max_tokens,
-            "timeout": runtime.settings.llama.timeout,
-        }
+    _chat_defaults = runtime.chat_settings_for_mode(runtime.runtime_chat_mode)
+    runtime.runtime_chat_params = {
+        "model": _chat_defaults.chat_model,
+        "base_url": _chat_defaults.base_url,
+        "api_key": _chat_defaults.api_key,
+        "temperature": _chat_defaults.temperature,
+        "max_tokens": _chat_defaults.max_tokens,
+        "timeout": _chat_defaults.timeout,
+        "max_retries": getattr(_chat_defaults, "max_retries", 4),
+    }
     if runtime.settings.embedding_mode == "ollama":
         runtime.runtime_embed_params = {
             "model": runtime.settings.ollama.embedding_model,
@@ -345,6 +487,27 @@ def main():
 
     if runtime.settings.debug:
         logging_exceptions.install_excepthook()
+
+    # Chromium auto-update (config-gated, interval-stamped, visible progress).
+    # Runs before heavy init so the new browser is in place for this session.
+    try:
+        from browser_updater import maybe_update_browsers
+        maybe_update_browsers(
+            python_exe=sys.executable,
+            browsers_path=Path("playwright_browsers").resolve(),
+            enabled=runtime.settings.browser_update.enabled,
+            check_interval_days=runtime.settings.browser_update.check_interval_days,
+        )
+    except Exception as exc:
+        logger.warning("[INSTALL] fallback: browser update hook failed (app continues): %s", exc)
+
+    # Name the console window so the launcher's zombie cleanup can find
+    # orphaned instances by title even when ExecutablePath is unreadable.
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW(f"AI_EveryNyan v0.18.0")
+    except Exception as exc:
+        logger.debug("[APP] fallback: could not set console title: %s", exc)
 
     logger.info(f"Starting AI_EveryNyan v0.18.0 (debug={runtime.settings.debug})")
     signal.signal(signal.SIGINT, signal_handler)

@@ -4,8 +4,8 @@
 
 **AI_EveryNyan** is a desktop AI application with an advanced memory architecture and support for external tools via MCP (Model Context Protocol). Unlike ordinary chatbots, EveryNyan keeps a "digital diary", summarizes conversations, can search the web (through SearXNG) and extract content from web pages.
 
-The application is built on Python, uses local models (Ollama or a LLaMA server) and a hybrid storage system: **DuckDB** for exact history and **Qdrant** for semantic associations.
-**Current version:** v0.16.2 — with fully unified dual-backend support, streaming responses, an MCP agent, colored logging of tool calls, and a fixed critical bug in LLaMA mode.
+The application is built on Python, uses local models (Ollama, a LLaMA server, or **any OpenAI-compatible API**) and a hybrid storage system: **DuckDB** for exact history and **Qdrant** for semantic associations.
+**Current version:** v0.16.2 — with fully unified multi-backend support (Ollama / LLaMA / OpenAI-compatible), streaming responses, an MCP agent, colored logging of tool calls, and self-healing backends (Qdrant, SearXNG, ComfyUI).
 
 ---
 
@@ -37,9 +37,10 @@ Cosine similarity of new messages against history. If the AI starts repeating it
 ### 👁️ AI Internal Thoughts UI
 The "Internal Thoughts" panel in DearPyGui shows processes in real time: RAG queries, tool calls, errors, model reasoning_content. In v0.16.2 **colored logging of MCP tools** was added: calls (yellow) and results (green/red).
 
-### 🔌 Two Backends: Ollama and LLaMA
+### 🔌 Three Backends: Ollama, LLaMA, OpenAI-compatible
 - **Ollama** — primary mode, full streaming and metadata support.
 - **LLaMA** — mode for local servers (e.g. `llama-server`). A critical bug in answer saving was fully fixed in v0.16.1, and a fallback to direct LLM on agent errors was added in v0.16.2.
+- **OpenAI-compatible** (`openai_compat`) — any server exposing `/chat/completions` + `/models`: OpenAI, OpenRouter, Mistral, LM Studio, vLLM. Configured by three fields: `base_url`, `api_key`, `chat_model`. Switchable live from the GUI.
 
 ### 🧹 Lemmatization for RAG (via spaCy)
 Message and diary text before indexing is processed through `ru_core_news_sm` and `en_core_web_sm`, which improves search quality.
@@ -104,7 +105,11 @@ Read-only only; all paths are validated against `workspace_dir` (path traversal 
 - **Colored logging** of all tool calls and results in the SYSTEM LOG panel.
 - **Agent error fallback** — if the MCP agent crashes, the system switches to a direct LLM call.
 - **Auto-discovery** — every `tool_*.py` is connected automatically through `__init__.py`.
-- **SearXNG warm probe** — if the meta-search is unavailable, `web_search` is automatically excluded from the agent with a loud warning `[MCP] fallback` (a dead backend never reaches the LLM prompt).
+- **SearXNG fallback chain** (`mcp_health`) — local instance over plain HTTP; if it is down, public instances are probed ONLY via nodriver (plain HTTP gets 429/403 there), with a session health cache and per-instance cooldowns; if everything is dead, `web_search` is dropped from the agent (fail soft, log loud).
+- **Dead-model handling** — 410/retired/429 errors get friendly messages; rate limits are retried by a Kilo-style silent ladder (10/30/60s) that never spams the chat; after exhaustion a fail-fast cooldown prevents retry loops, and changing chat settings resets it. Synthetic error replies are NEVER persisted to memory.
+- **Stale-agent guard** — after a model switch the react agent is rebuilt inline before generation, so the old backend can never answer.
+- **Time awareness** — the system prompt carries the current local time and history messages carry `[YYYY-MM-DD HH:MM]` prefixes, so the character can reason about when things happened. Echoed prefixes are stripped from replies.
+- **Copyable chat** — double-click a message to copy its full text to the clipboard.
 
 ### 🗄️ Qdrant: Docker-first + Portable Fallback
 The vector DB can operate in two modes with fully compatible data:
@@ -112,6 +117,12 @@ The vector DB can operate in two modes with fully compatible data:
 - **Portable binary** (`bin\qd\qdrant.exe`, v1.19.1) — automatic fallback when Docker is unavailable, also self-started by the runtime (`src/qdrant_backend.py`) if Qdrant is not running.
 
 Both backends serve the same `http://localhost:6333` and the same storage `data\qdrant_storage` (segment formats and WAL are byte-for-byte compatible) — collection survives the Docker ↔ exe switch in both directions, and the Python code doesn't distinguish the backend at all. For a forced backend choice, set `$use_portable_qd = 1` in `run_qdrant.ps1`.
+
+### 🖥️ ComfyUI: Auto-discovery
+`comfyui.server` from `settings.yaml` is the single source of truth. If the configured endpoint is not answering, the runtime auto-discovers a running ComfyUI by scanning python processes (cmdline heuristic + `--port` + HTTP verification) — a port change in the ComfyUI launcher never desynchronizes the monitor or `generate_image`.
+
+### 🔄 Chromium Auto-update (`browser_updater`)
+Browser revisions are pinned to the playwright package version. At runtime startup (and in the installer) the updater checks PyPI, upgrades playwright, re-downloads Chromium, runs a real smoke test, and only then prunes old revisions. Gated by `browser_update.enabled` + `check_interval_days`; download progress is visible in the console.
 
 ---
 
@@ -141,22 +152,31 @@ The application includes an automatic PowerShell installer.
 ### 2. Configuration (Optional)
 Edit `config/settings.yaml`. Example:
 ```yaml
-chat_mode: "ollama"   # or "llama"
+chat_mode: "ollama"   # or "llama", or "openai"
 ollama:
   chat_model: "qwen2.5:7b"
 llama:
   base_url: "http://127.0.0.1:8088/v1"
   chat_model: "Falcon-H1R-7B-Q8_0.gguf"
+openai_compat:         # any /chat/completions + /models server
+  base_url: "https://api.openai.com/v1"
+  api_key: "sk-..."
+  chat_model: "gpt-4o-mini"
+# Chromium auto-update at runtime startup (visible download progress)
+browser_update:
+  enabled: true
+  check_interval_days: 3
 # For MCP tools (SearXNG)
 searxng_url: "http://localhost:2597"
+searxng_fallback_urls: []   # empty -> built-in verified public instances
 ```
 
 > **Note:** `embedding_model` must be `bge-m3:latest`, `embedding_dim` — `1024`.
 
 ### 3. Launch
 1. **Qdrant:** `.\run_qdrant.bat` — Docker-first; if Docker is unavailable (or `$use_portable_qd = 1` in `run_qdrant.ps1`), the portable binary is auto-downloaded and started from `bin\qd\`. The runtime also self-starts the portable backend if Qdrant was not launched. The Python side does not notice the difference (the same `http://localhost:6333`, the same storage `data\qdrant_storage`).
-2. **SearXNG (for web search):** `.\run_searxng.bat` — if the container is not up, the runtime excludes `web_search` from the MCP agent with a warning (fetch_url works without it).
-3. **Ollama / LLaMA-server**
+2. **SearXNG (for web search):** `.\run_searxng.bat` — if the container is not up, the runtime falls back to verified public instances (probed via headless browser); if those are dead too, `web_search` is excluded from the MCP agent with a warning (fetch_url works without it).
+3. **Ollama / LLaMA-server / OpenAI-compatible endpoint** — the launcher also pings the selected `chat_model` and warns if it is dead or rate-limited before the app starts.
 4. **Application:** `.\run_ai_everynyan.bat`
 
 ---
@@ -170,31 +190,26 @@ AI_EveryNyan/
 ├── run_qdrant.bat               # wrapper (logic lives in run_qdrant.ps1)
 ├── run_qdrant.ps1               # Qdrant launcher: Docker-first, portable fallback in bin\qd
 ├── src/
-│   ├── main.py                # v0.16.2: MCP agent, colored logging, fallback
-│   ├── runtime.py             # v0.17.9: runtime state, Qdrant and SearXNG warmup
+│   ├── main.py                # v0.17.10: MCP agent, colored logging, error handling, retry ladder
+│   ├── runtime.py             # v0.17.11: runtime state, Qdrant/SearXNG warmup, chat modes, cooldown
 │   ├── qdrant_backend.py      # v1.0.1: auto-start portable Qdrant (bin\qd)
-│   ├── mcp_health.py          # v1.0.0: SearXNG availability probe
-│   ├── memory_manager.py      # v0.7.0: JSON metadata, circumplex model
+│   ├── mcp_health.py          # v1.1.0: SearXNG fallback resolver (nodriver probes, health cache)
+│   ├── comfyui_discovery.py   # v1.0.0: ComfyUI server auto-discovery (process scan)
+│   ├── browser_updater.py     # v1.0.0: Chromium auto-update (pip + smoke test + prune)
+│   ├── memory_manager.py      # v0.7.1: JSON metadata, circumplex model, timestamp helper
 │   └── query_preprocessor.py  # v0.2.0: lemmatization
 ├── tools/mcp/
 │   ├── __init__.py             # auto-discovery of tool_*.py, MultiServerMCPClient
-│   ├── tool_searxng.py         # v0.4.2: SearXNG + fetch_url (playwright/nodriver/legacy)
-│   ├── tool_browser.py         # v0.1.0: open_url
-│   ├── tool_calculator.py      # v0.1.0: calculate + convert_units
-│   ├── tool_currency.py        # v0.1.0: currency conversion (frankfurter.app + open.er-api.com)
-│   ├── tool_datetime.py        # v0.1.0: date/time, timezones, time_diff
-│   ├── tool_weather.py         # v0.1.0: weather wttr.in (current + 3-day forecast)
-│   ├── tool_random.py          # v0.1.0: UUID, strings, numbers, random pick
-│   ├── tool_workspace.py       # v0.1.0: read-only file system sandbox
-│   ├── tool_system.py          # v0.1.0: OS/CPU/RAM/disk info
-│   ├── tool_vision.py          # v0.3.5: image analysis (VL models)
-│   ├── tool_comfyui.py         # v0.1.0: image generation (ComfyUI API)
-│   └── tool_character.py       # v0.4.0: character appearance management
+│   ├── tool_searxng.py         # v0.6.0: SearXNG + fetch_url (chunked output, nodriver routing)
+│   ├── tool_comfyui.py         # v0.1.0: image generation (ComfyUI API, server auto-discovery)
+│   └── ...                     # 10 more tool servers
 ├── config/
 │   ├── settings.yaml
+│   ├── searxng_settings.reference.yml  # tracked reference of tuned SearXNG engines
 │   └── character/
 │       ├── base.yaml
 │       └── appearance.yaml
+├── tests/                      # 58 unit tests (backends, probes, chunking, config)
 ├── data/ (history.db, qdrant_storage)
 └── logs/
 ```
@@ -273,7 +288,14 @@ GUI (DearPyGui) on the main thread, LLM requests and RAG on a background `asynci
 - ✅ Fixed critical bug with `None` answers in LLaMA mode.
 - ✅ Graceful shutdown and colored MCP logging.
 - ✅ **Portable Qdrant** (`bin\qd`) — Docker-first launcher, mandatory installer step, auto-start by runtime when launch was forgotten.
-- ✅ **SearXNG warm probe** — `web_search` is excluded from the MCP agent when the backend is unavailable (fail soft, log loud).
+- ✅ **SearXNG fallback chain** — local instance → public instances (nodriver-probed, health cache + cooldowns) → `web_search` excluded; error replies are never persisted to memory.
+- ✅ **OpenAI-compatible chat mode** — any `/chat/completions` server via three config fields, live-switchable in the GUI.
+- ✅ **Time awareness** — current time in the system prompt, timestamped history; echoed prefixes stripped from replies.
+- ✅ **Silent rate-limit ladder + fail-fast cooldown** — per-minute quotas waited out without chat spam; dead backends error instantly instead of looping.
+- ✅ **ComfyUI auto-discovery** — config-first server resolution with process-scan fallback; quiet connection logging (transitions only).
+- ✅ **Chromium auto-update** — PyPI check at startup (config-gated), visible download progress, smoke test, stale-revision pruning.
+- ✅ **Copyable chat** — double-click a message to copy it.
+- ✅ **Launcher model ping** — the preflight warns if the selected `chat_model` is dead or rate-limited before the app starts.
 
 ### In Active Development (WIP)
 - 🚧 **Internal thoughts (proactivity)** — periodic generation of random thoughts saved to the diary.

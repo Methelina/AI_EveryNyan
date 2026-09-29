@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Установщик AI_EveryNyan (плоская структура).
     Создает Conda-окружение, устанавливает зависимости, скачивает bge-m3 в Ollama,
@@ -11,6 +11,10 @@
     Author: Soror L.'.L.'.
     Updated: 2026-09-29
 #>
+
+# Patchnote v0.8.3:
+#   [+] Шаг 5b: playwright обновляется до свежей версии (pip --upgrade) перед
+#       установкой Chromium - ревизия браузера привязана к версии пакета
 
 # Patchnote v0.8.2:
 #   [+] Установка портативного Qdrant (bin\qd) стала обязательным шагом [2b/8]:
@@ -401,7 +405,7 @@ if (Test-Path $ReqFile) {
 Write-Status "`n[5b/8] Установка Playwright и Chromium в проект..." "INFO"
 
 # Убедимся, что playwright установлен
-& $PythonExe -m pip install playwright>=1.40.0 --no-warn-script-location
+& $PythonExe -m pip install --upgrade playwright --no-warn-script-location
 if ($LASTEXITCODE -ne 0) {
     Write-Status "  [!] Не удалось установить playwright" "WARN"
 } else {

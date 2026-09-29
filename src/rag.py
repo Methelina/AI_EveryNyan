@@ -3,9 +3,14 @@ RAG queries, anti-repeat checks, context dumping, and memory persistence for AI_
 Semantic search via Qdrant, keyword fallback via DuckDB, dialogue metadata extraction.
 
 /src/rag.py
-Version:     0.17.6
+Version:     0.17.7
 Author:      Soror L.'.L.'.
-Updated:     2026-05-01
+Updated:     2026-09-29
+
+Patch Notes v0.17.7 (Soror L'.L'.):
+  [+] Live session_context appends now stamp "timestamp" (ISO) on user and
+      assistant messages - dialogue history in the prompt becomes fully
+      time-annotated together with format_timestamp() prefixing in main.py.
 
 Patch Notes v0.17.6 (by pytraveler):
   [+] Extracted from main.py: query_memory(), keyword_search_in_history(), check_plagiarism().
@@ -100,23 +105,43 @@ async def query_memory(query: str, top_k: Optional[int] = None,
 async def keyword_search_in_history(query: str, limit: int = 3) -> str:
     if not runtime.memory_manager:
         return ""
-    keywords = [w for w in query.lower().split() if len(w) > 3]
-    if not keywords:
+    STOPWORDS = {
+        "это", "что", "тебе", "себе", "мне", "теперь", "когда", "если", "быть",
+        "есть", "было", "была", "чтобы", "какая", "какой", "какое", "твоё",
+        "твои", "наш", "они", "него", "неё", "even", "this", "that", "with",
+        "just", "your", "have", "what", "when", "как", "дела", "ответ",
+    }
+    keywords = [
+        w for w in query.lower().split()
+        if len(w) > 3 and w not in STOPWORDS and w.isalpha()
+    ]
+    if len(keywords) < 2:
+        # Fewer than two meaningful words: a LIKE search would match arbitrary
+        # old chatter (e.g. every "тебе/что") and inject the same memories for
+        # every query - which made the character repeat one greeting forever.
         return ""
     try:
         conn = runtime.memory_manager.conn
-        conditions = " OR ".join([f"LOWER(content) LIKE '%{kw}%'" for kw in keywords])
+        # Score rows by DISTINCT keyword matches; require at least 2 matched
+        # keywords so a single common word cannot summon the same memories.
+        score_terms = " + ".join(
+            [f"(CASE WHEN LOWER(content) LIKE '%{kw}%' THEN 1 ELSE 0 END)" for kw in keywords]
+        )
+        where_terms = " OR ".join([f"LOWER(content) LIKE '%{kw}%'" for kw in keywords])
         rows = conn.execute(
             f"""
-            SELECT role, content, timestamp FROM chat_history
-            WHERE {conditions} ORDER BY timestamp DESC LIMIT ?
+            SELECT role, content, timestamp, ({score_terms}) AS score
+            FROM chat_history
+            WHERE ({where_terms}) AND ({score_terms}) >= 2
+            ORDER BY score DESC, timestamp DESC
+            LIMIT ?
         """,
             [limit],
         ).fetchall()
         if not rows:
             return ""
         result_parts = []
-        for role, content, ts in rows:
+        for role, content, ts, score in rows:
             sender = "User" if role == "user" else "AI"
             result_parts.append(f"[{ts}] {sender}: {content[:300]}")
         return "\n\n".join(result_parts)
@@ -283,8 +308,9 @@ async def save_to_memory(user_text: str, ai_response: str):
         runtime.memory_manager.save_message("assistant", ai_response)
         _add_ai_thought("[DB] Saved dialogue to chat_history", (150,200,150))
 
-    runtime.session_context.append({"role": "user", "content": user_text})
-    runtime.session_context.append({"role": "assistant", "content": ai_response})
+    now_iso = datetime.now().isoformat()
+    runtime.session_context.append({"role": "user", "content": user_text, "timestamp": now_iso})
+    runtime.session_context.append({"role": "assistant", "content": ai_response, "timestamp": now_iso})
     _add_ai_thought(f"[CTX] Context size: {len(runtime.session_context)} messages", (150,180,200))
 
     if runtime.vector_store:

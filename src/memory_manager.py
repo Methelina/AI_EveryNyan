@@ -4,9 +4,13 @@ Uses DuckDB for structured chat history and Qdrant for semantic RAG memory.
 Provides Sliding Window mechanism and smart context dumping.
 
 /src/memory_manager.py
-Version:     0.7.0
+Version:     0.7.1
 Author:      Soror L.'.L.'.
-Updated:     2026-04-21
+Updated:     2026-09-29
+
+Patch Notes v0.7.1 (Soror L'.L'.):
+  [+] format_timestamp(): public helper - renders a message timestamp
+      (datetime or ISO string) as "[YYYY-MM-DD HH:MM]" for prompt assembly.
 Changes:
   [+] Switched to JSON-mode for metadata parsing (no regex).
   [+] Added circumplex model: affect_valence [-1..1], affect_arousal [-1..1].
@@ -17,9 +21,26 @@ Changes:
 
 import duckdb
 import json
+from datetime import datetime
 from logger import logger
 import re
 from pathlib import Path
+
+
+def format_timestamp(ts) -> str:
+    """Render a message timestamp as "[YYYY-MM-DD HH:MM]" for prompt assembly.
+
+    Accepts datetime objects (DuckDB returns those) and ISO strings; returns
+    an empty string for None/unparseable values so callers can prefix safely.
+    """
+    if ts is None:
+        return ""
+    if isinstance(ts, datetime):
+        return ts.strftime("[%Y-%m-%d %H:%M]")
+    try:
+        return datetime.fromisoformat(str(ts)).strftime("[%Y-%m-%d %H:%M]")
+    except (ValueError, TypeError):
+        return ""
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 

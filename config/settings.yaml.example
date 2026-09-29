@@ -156,4 +156,24 @@ workspace:
 searxng_url: "http://localhost:2597"
 searxng_fallback_urls: []           # e.g. ["https://search.mectov.my.id", "https://sx.xo.st"]
 
+# Generic OpenAI-compatible chat backend (chat_mode: "openai" to activate).
+# Any server exposing /chat/completions + /models: OpenAI, OpenRouter,
+# LM Studio, vLLM, ollama-cloud endpoints, etc.
+openai_compat:
+  base_url: "https://api.openai.com/v1"
+  api_key: ""                       # sk-... (empty ok for local servers)
+  chat_model: "gpt-4o-mini"
+  temperature: 0.7
+  max_tokens: 4096
+  timeout: 180
+  max_retries: 2                    # short SDK retries; minute-quota pacing via outer ladder
+  token_dump_threshold: 20000
+
+# Chromium auto-update (playwright_browsers). Check = one PyPI request;
+# the ~150 MB download (visible progress) runs only when a newer version
+# exists and the interval has elapsed. Disable to freeze the browser version.
+browser_update:
+  enabled: true
+  check_interval_days: 3
+
 debug: false

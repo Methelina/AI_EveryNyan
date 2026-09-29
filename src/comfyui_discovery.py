@@ -12,9 +12,13 @@ Both the monitor daemon (src\\comfyui_monitor.py) and the MCP tool
 the ComfyUI launcher never desynchronises them again.
 
 src/comfyui_discovery.py
-Version:     1.0.0
+Version:     1.1.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-29
+
+Patch Notes v1.1.0 (Soror L'.L'.):
+  [+] IPv6-aware discovery: ComfyUI launched with --listen may bind only to
+      '::' on Windows; candidates now probe both 127.0.0.1 and [::1].
 
 Patch Notes v1.0.0 (Soror L'.L'.):
   [+] New module: resolve_comfyui_server() + discover_comfyui_server()
@@ -72,14 +76,18 @@ def discover_comfyui_server() -> Optional[str]:
                 continue
             port_match = re.search(r"--port[ =](\d+)", cmdline)
             port = int(port_match.group(1)) if port_match else 8188
-            candidate = f"127.0.0.1:{port}"
-            if probe_comfyui(candidate):
-                _discovered = candidate
-                logger.info(
-                    "[COMFYUI] auto-discovered backend: pid=%s server=%s", info["pid"], candidate
-                )
-                return candidate
-            logger.debug("[COMFYUI] candidate %s (pid %s) did not answer", candidate, info["pid"])
+            # --listen can bind IPv6-only on Windows; probe both stacks.
+            for candidate in (f"127.0.0.1:{port}", f"[::1]:{port}"):
+                if probe_comfyui(candidate):
+                    _discovered = candidate
+                    logger.info(
+                        "[COMFYUI] auto-discovered backend: pid=%s server=%s", info["pid"], candidate
+                    )
+                    return candidate
+            logger.debug(
+                "[COMFYUI] candidates 127.0.0.1:%s/[::1]:%s (pid %s) did not answer",
+                port, port, info["pid"],
+            )
         except Exception:  # noqa: BLE001 - skip processes we cannot inspect
             continue
 

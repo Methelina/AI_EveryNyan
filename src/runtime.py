@@ -4,9 +4,17 @@ Holds all mutable global state (settings, LLM, vector store, etc.).
 Provides component initialization, embedding/LLM reinit, and MCP agent setup.
 
 /src/runtime.py
-Version:     0.17.10
+Version:     0.17.11
 Author:      Soror L.'.L.'.
 Updated:     2026-09-29
+
+Patch Notes v0.17.11 (Soror L'.L'.):
+  [+] chat_mode "openai": generic OpenAI-compatible backend (any /chat/completions
+      + /models server) via settings.openai_compat. Routed through the same
+      ChatOpenAI path as ollama; model list via Bearer /models.
+  [+] LLM backend cooldown (mark_llm_cooldown / llm_cooldown_remaining /
+      reset_llm_cooldown): after retry-ladder exhaustion new messages fail
+      fast instead of re-entering the ladder; any chat-settings reinit resets.
 
 Patch Notes v0.17.10 (Soror L'.L'.):
   [+] init_mcp_agent(): SearXNG URL resolution via mcp_health.aresolve_searxng_url
@@ -165,7 +173,7 @@ def init_components():
         embedding=embeddings
     )
 
-    if settings.chat_mode == "ollama":
+    if settings.chat_mode in ("ollama", "openai"):
         llm = ChatOpenAI(
             model=chat_cfg.chat_model,
             openai_api_key=chat_cfg.api_key,
@@ -173,9 +181,10 @@ def init_components():
             temperature=chat_cfg.temperature,
             timeout=chat_cfg.timeout,
             max_tokens=chat_cfg.max_tokens,
+            max_retries=getattr(chat_cfg, "max_retries", 4),
             streaming=False
         )
-        logger.info("LLM initialized as ChatOpenAI (Ollama mode)")
+        logger.info("LLM initialized as ChatOpenAI (mode=%s)", settings.chat_mode)
     else:
         api_key_to_use = chat_cfg.api_key if chat_cfg.api_key else "not-needed"
         llm = LlamaChatModel(
@@ -295,7 +304,7 @@ async def init_mcp_agent():
             tools = [unwrap_tool(t) for t in raw_tools]
 
             agent_model = llm
-            if settings.chat_mode != "ollama":
+            if settings.chat_mode not in ("ollama", "openai"):
                 chat_cfg = settings.get_chat_config()
                 api_key = chat_cfg.api_key if chat_cfg.api_key else "not-needed"
                 agent_model = ChatOpenAI(
@@ -340,23 +349,69 @@ async def init_mcp_agent():
 # Dynamic runtime reconfiguration
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# LLM backend cooldown: after repeated rate-limit failures, new messages fail
+# fast (no retry ladder) until the cooldown expires or the user changes chat
+# settings (any reinit resets it).
+# ---------------------------------------------------------------------------
+_llm_cooldown_until: float = 0.0
+
+# Set by reinit_llm: the react agent still holds the PREVIOUS model until the
+# async rebuild finishes. process_message checks it and rebuilds INLINE before
+# generating, so a model switch can never be answered by the stale backend.
+agent_needs_rebuild: bool = False
+
+
+def mark_llm_cooldown(seconds: float = 300.0) -> None:
+    global _llm_cooldown_until
+    import time as _t
+    _llm_cooldown_until = _t.monotonic() + seconds
+    logger.warning(
+        "[LLM] backend marked unhealthy - fast-fail cooldown for %ss "
+        "(send a message again after that, or change chat settings to reset now)",
+        seconds,
+    )
+
+
+def llm_cooldown_remaining() -> int:
+    import time as _t
+    return max(0, int(_llm_cooldown_until - _t.monotonic()))
+
+
+def reset_llm_cooldown() -> None:
+    global _llm_cooldown_until
+    _llm_cooldown_until = 0.0
+
+
+def chat_settings_for_mode(mode: str):
+    """Settings section for a chat mode ('ollama' | 'llama' | 'openai')."""
+    return {
+        "ollama": settings.ollama,
+        "openai": settings.openai_compat,
+    }.get(mode, settings.llama)
+
+
 def reinit_llm():
-    global llm, react_agent
+    global llm, react_agent, agent_needs_rebuild
+    reset_llm_cooldown()  # user changed chat settings - trust the new backend
+    agent_needs_rebuild = True  # stale agent must not answer with the old model
     mode = runtime_chat_mode
     params = runtime_chat_params.copy()
+    defaults = chat_settings_for_mode(mode)
     logger.info(f"[DYNAMIC] Reinitializing LLM: mode={mode}, params={params}")
 
-    if mode == "ollama":
+    if mode in ("ollama", "openai"):
         llm = ChatOpenAI(
-            model=params.get("model", settings.ollama.chat_model),
-            openai_api_key=params.get("api_key", settings.ollama.api_key),
-            openai_api_base=params.get("base_url", settings.ollama.base_url),
-            temperature=params.get("temperature", settings.ollama.temperature),
-            timeout=params.get("timeout", settings.ollama.timeout),
-            max_tokens=params.get("max_tokens", settings.ollama.max_tokens),
+            model=params.get("model", defaults.chat_model),
+            openai_api_key=params.get("api_key", defaults.api_key),
+            openai_api_base=params.get("base_url", defaults.base_url),
+            temperature=params.get("temperature", defaults.temperature),
+            timeout=params.get("timeout", defaults.timeout),
+            max_tokens=params.get("max_tokens", defaults.max_tokens),
+            max_retries=params.get("max_retries", getattr(defaults, "max_retries", 4)),
             streaming=False
         )
-        logger.info("LLM reinitialized as ChatOpenAI (Ollama)")
+        logger.info("LLM reinitialized as ChatOpenAI (mode=%s)", mode)
     else:
         api_key = params.get("api_key", settings.llama.api_key) or "not-needed"
         llm = LlamaChatModel(
@@ -377,7 +432,7 @@ def reinit_llm():
 
 
 async def _recreate_mcp_agent():
-    global mcp_client, react_agent
+    global mcp_client, react_agent, agent_needs_rebuild
     if mcp_client:
         raw_tools = await mcp_client.get_tools()
         if raw_tools:
@@ -400,7 +455,7 @@ async def _recreate_mcp_agent():
                 )
             tools = [unwrap_tool(t) for t in raw_tools]
             agent_model = llm
-            if runtime_chat_mode != "ollama":
+            if runtime_chat_mode not in ("ollama", "openai"):
                 agent_model = ChatOpenAI(
                     model=runtime_chat_params.get("model", settings.llama.chat_model),
                     openai_api_key=runtime_chat_params.get("api_key", "not-needed"),
@@ -411,6 +466,7 @@ async def _recreate_mcp_agent():
                     streaming=False,
                 )
             react_agent = create_react_agent(model=agent_model, tools=tools)
+            agent_needs_rebuild = False  # inline rebuild done - agent is current
             logger.info("[MCP] React agent reinitialized after chat change")
 
 
@@ -471,12 +527,9 @@ def apply_chat_settings(ui_values: dict):
     chat_mode_from_ui = ui_values.get("chat_mode")
     if chat_mode_from_ui:
         runtime_chat_mode = chat_mode_from_ui
-        if runtime_chat_mode == "ollama":
-            runtime_chat_params["base_url"] = settings.ollama.base_url
-            runtime_chat_params["api_key"] = settings.ollama.api_key
-        else:
-            runtime_chat_params["base_url"] = settings.llama.base_url
-            runtime_chat_params["api_key"] = settings.llama.api_key
+        defaults = chat_settings_for_mode(runtime_chat_mode)
+        runtime_chat_params["base_url"] = defaults.base_url
+        runtime_chat_params["api_key"] = defaults.api_key
 
     runtime_chat_params.update({
         "model": ui_values.get("model", runtime_chat_params.get("model")),
@@ -521,24 +574,15 @@ def reset_to_yaml_defaults():
     runtime_chat_mode = settings.chat_mode
     runtime_embed_mode = settings.embedding_mode
 
-    if runtime_chat_mode == "ollama":
-        runtime_chat_params = {
-            "model": settings.ollama.chat_model,
-            "base_url": settings.ollama.base_url,
-            "api_key": settings.ollama.api_key,
-            "temperature": settings.ollama.temperature,
-            "max_tokens": settings.ollama.max_tokens,
-            "timeout": settings.ollama.timeout,
-        }
-    else:
-        runtime_chat_params = {
-            "model": settings.llama.chat_model,
-            "base_url": settings.llama.base_url,
-            "api_key": settings.llama.api_key,
-            "temperature": settings.llama.temperature,
-            "max_tokens": settings.llama.max_tokens,
-            "timeout": settings.llama.timeout,
-        }
+    defaults = chat_settings_for_mode(runtime_chat_mode)
+    runtime_chat_params = {
+        "model": defaults.chat_model,
+        "base_url": defaults.base_url,
+        "api_key": defaults.api_key,
+        "temperature": defaults.temperature,
+        "max_tokens": defaults.max_tokens,
+        "timeout": defaults.timeout,
+    }
     if settings.embedding_mode == "ollama":
         runtime_embed_params = {
             "model": settings.ollama.embedding_model,

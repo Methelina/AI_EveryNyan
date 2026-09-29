@@ -3,9 +3,23 @@ Application configuration models and character config loader for AI_EveryNyan.
 Pydantic-based settings with YAML override. Character YAML/JSON file loader.
 
 /src/config.py
-Version:     0.17.8
+Version:     0.18.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-29
+
+Patch Notes v0.18.0 (Soror L'.L'.):
+  [+] OpenAICompatSettings + chat_mode "openai": generic OpenAI-compatible
+      chat backend (any /chat/completions + /models server), config section
+      openai_compat (base_url, api_key, chat_model).
+  [+] max_retries on Ollama/OpenAICompat chat settings: SDK retry count for
+      429/5xx. Kept SHORT (2) on purpose for cloud providers with per-minute
+      quotas - long-wait pacing is done by the outer silent retry ladder in
+      main.py (see RATE_LIMIT_DELAYS), so quota windows are not burned by
+      rapid-fire SDK attempts.
+
+Patch Notes v0.17.9 (Soror L'.L'.):
+  [+] BrowserUpdateSettings: gating for the Chromium auto-updater
+      (enabled + check_interval_days), consumed by src\\browser_updater.py.
 
 Patch Notes v0.17.8 (Soror L'.L'.):
   [+] AppSettings.searxng_url / searxng_fallback_urls: explicit SearXNG fields.
@@ -46,6 +60,7 @@ class OllamaSettings(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 2048
     token_dump_threshold: int = 20000
+    max_retries: int = 4
 
 
 class LlamaSettings(BaseModel):
@@ -56,6 +71,23 @@ class LlamaSettings(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 4096
     token_dump_threshold: int = 20000
+
+
+class OpenAICompatSettings(BaseModel):
+    """Generic OpenAI-compatible chat backend: any server that exposes
+    /chat/completions + /models (OpenAI, OpenRouter, LM Studio, vLLM, ...).
+    Set chat_mode: "openai" to activate; api_key may be empty for local servers.
+    max_retries: SDK retry attempts for 429/5xx - exponential backoff with
+    jitter, honors the server's Retry-After header (rate-limit tiers often
+    need more than the default 2 retries)."""
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    chat_model: str = "gpt-4o-mini"
+    timeout: int = 180
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    token_dump_threshold: int = 20000
+    max_retries: int = 2
 
 
 class QdrantSettings(BaseModel):
@@ -118,8 +150,19 @@ class ComfyUISettings(BaseModel):
     daemon_check_interval: float = 5.0
 
 
+class BrowserUpdateSettings(BaseModel):
+    """Chromium auto-update gating (src\\browser_updater.py).
+
+    The check itself is cheap (one PyPI JSON request); the actual download
+    (~150 MB, streamed with visible progress) only happens when a newer
+    playwright version exists and the interval has elapsed.
+    """
+    enabled: bool = True
+    check_interval_days: int = 3
+
+
 class AppSettings(BaseSettings):
-    chat_mode: Literal["ollama", "llama"] = "ollama"
+    chat_mode: Literal["ollama", "llama", "openai"] = "ollama"
     embedding_mode: Literal["ollama", "custom"] = "ollama"
 
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
@@ -134,6 +177,8 @@ class AppSettings(BaseSettings):
     context: ContextSettings = Field(default_factory=ContextSettings)
     comfyui: ComfyUISettings = Field(default_factory=ComfyUISettings)
     workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
+    openai_compat: OpenAICompatSettings = Field(default_factory=OpenAICompatSettings)
+    browser_update: BrowserUpdateSettings = Field(default_factory=BrowserUpdateSettings)
 
     # SearXNG meta-search: primary endpoint + optional public fallback chain.
     # Empty searxng_fallback_urls -> mcp_health.DEFAULT_FALLBACK_URLS is used.
@@ -159,8 +204,9 @@ class AppSettings(BaseSettings):
     def get_chat_config(self):
         if self.chat_mode == "ollama":
             return self.ollama
-        else:
-            return self.llama
+        if self.chat_mode == "openai":
+            return self.openai_compat
+        return self.llama
 
     def get_embedding_config(self):
         if self.embedding_mode == "ollama":
