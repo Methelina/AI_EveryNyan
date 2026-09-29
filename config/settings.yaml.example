@@ -148,4 +148,12 @@ workspace:
   allow_hidden_files: false         # whether to show dotfiles in listings
   max_line_count_size: 1048576      # compute line count only for files <= this size
 
+# SearXNG meta-search (MCP web_search).
+# Local instance is queried over plain HTTP; if it is unreachable, the runtime
+# probes public fallback instances via headless browser (nodriver) - plain HTTP
+# gets rate-limited/blocked there. Empty list -> built-in verified defaults.
+# Privacy note: queries to public instances leave your machine.
+searxng_url: "http://localhost:2597"
+searxng_fallback_urls: []           # e.g. ["https://search.mectov.my.id", "https://sx.xo.st"]
+
 debug: false

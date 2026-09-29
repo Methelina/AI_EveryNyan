@@ -3,9 +3,14 @@ Application configuration models and character config loader for AI_EveryNyan.
 Pydantic-based settings with YAML override. Character YAML/JSON file loader.
 
 /src/config.py
-Version:     0.17.7
+Version:     0.17.8
 Author:      Soror L.'.L.'.
-Updated:     2026-05-05
+Updated:     2026-09-29
+
+Patch Notes v0.17.8 (Soror L'.L'.):
+  [+] AppSettings.searxng_url / searxng_fallback_urls: explicit SearXNG fields.
+      Previously searxng_url lived only in YAML and was silently dropped
+      (extra="ignore"), so the configured value never reached the runtime.
 
 Patch Notes v0.17.7 (by pytraveler):
   [+] WorkspaceSettings model: sandboxed file access config for LLM tools
@@ -129,6 +134,12 @@ class AppSettings(BaseSettings):
     context: ContextSettings = Field(default_factory=ContextSettings)
     comfyui: ComfyUISettings = Field(default_factory=ComfyUISettings)
     workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
+
+    # SearXNG meta-search: primary endpoint + optional public fallback chain.
+    # Empty searxng_fallback_urls -> mcp_health.DEFAULT_FALLBACK_URLS is used.
+    searxng_url: str = "http://localhost:2597"
+    searxng_fallback_urls: List[str] = Field(default_factory=list)
+
     debug: bool = False
 
     model_config = ConfigDict(

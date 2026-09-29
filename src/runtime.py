@@ -4,9 +4,17 @@ Holds all mutable global state (settings, LLM, vector store, etc.).
 Provides component initialization, embedding/LLM reinit, and MCP agent setup.
 
 /src/runtime.py
-Version:     0.17.9
+Version:     0.17.10
 Author:      Soror L.'.L.'.
 Updated:     2026-09-29
+
+Patch Notes v0.17.10 (Soror L'.L'.):
+  [+] init_mcp_agent(): SearXNG URL resolution via mcp_health.aresolve_searxng_url
+      - local instance -> plain HTTP as before;
+      - local dead -> public fallbacks probed ONLY via nodriver (plain HTTP is
+        blocked on public instances) with session health cache + cooldowns;
+      - SEARXNG_FALLBACK_URLS passed to the MCP subprocess for per-call rotation;
+      - nothing reachable -> web_search still dropped with the loud warning.
 
 Patch Notes v0.17.9 (Soror L'.L'.):
   [+] init_components(): Qdrant warm-up via qdrant_backend.ensure_qdrant()
@@ -214,22 +222,49 @@ async def init_mcp_agent():
         from tools.mcp import return_mcp_client
         from langchain_core.tools import StructuredTool
 
-        searxng_url = getattr(settings, "searxng_url", "http://localhost:2597")
-        mcp_client = return_mcp_client(SEARXNG_URL=searxng_url)
+        # Warm-up resolution: the FastMCP stdio subprocess always starts and
+        # always advertises its tools, so discovery alone proves nothing about
+        # SearXNG. Routing policy (validated on 75 public instances):
+        #   - local instance  -> plain HTTP probe + query;
+        #   - local dead      -> public fallback chain probed ONLY via nodriver
+        #     (plain HTTP gets 429/403 there), per-call rotation inside the tool;
+        #   - nothing live    -> web_search is dropped from the agent so a dead
+        #     backend never pollutes the LLM prompt (fail soft, log loud).
+        from mcp_health import (
+            DEFAULT_FALLBACK_URLS,
+            aresolve_searxng_url,
+            encode_fallback_env,
+        )
 
-        # Warm-up probe: the FastMCP stdio subprocess always starts and always
-        # advertises its tools, so discovery alone proves nothing about SearXNG.
-        # If the meta-search engine is unreachable, drop the SearXNG-dependent
-        # tool (web_search) from the agent - a dead backend must not pollute the
-        # LLM prompt - and warn loudly with the remedy (fail soft, log loud).
-        # fetch_url stays: it fetches URLs directly and needs no SearXNG container.
-        from mcp_health import probe_searxng
-        searxng_ok = probe_searxng(searxng_url)
+        primary_url = getattr(settings, "searxng_url", "http://localhost:2597")
+        configured = list(getattr(settings, "searxng_fallback_urls", None) or [])
+        fallback_urls = configured if configured else list(DEFAULT_FALLBACK_URLS)
+
+        searxng_url, searxng_via_browser = await aresolve_searxng_url(
+            primary_url, fallback_urls
+        )
+        searxng_ok = searxng_url is not None
+
+        mcp_env = {
+            "SEARXNG_URL": searxng_url or primary_url,  # tool still needs a base
+            "SEARXNG_FALLBACK_URLS": encode_fallback_env(fallback_urls),
+        }
+        if searxng_ok and searxng_via_browser:
+            mcp_env["SEARXNG_VIA_BROWSER"] = "1"
+            logger.warning(
+                "[MCP] fallback: local SearXNG unreachable - using public instance "
+                "%s via headless browser (queries leave your machine; privacy note). "
+                "For a local backend run .\\run_searxng.bat",
+                searxng_url,
+            )
+
+        mcp_client = return_mcp_client(**mcp_env)
+
         if not searxng_ok:
             logger.warning(
-                "[MCP] fallback: SearXNG at %s is unreachable - web_search "
-                "disabled for this session. Remedy: run .\\run_searxng.bat",
-                searxng_url,
+                "[MCP] fallback: SearXNG (local and all public fallbacks) is "
+                "unreachable - web_search disabled for this session. "
+                "Remedy: run .\\run_searxng.bat",
             )
             add_ai_thought(
                 "[MCP] SearXNG offline - web search disabled (run .\\run_searxng.bat)",
