@@ -145,7 +145,7 @@ searxng_url: "http://localhost:2597"
 > **Важно:** `embedding_model` должен быть `bge-m3:latest`, `embedding_dim` — `1024`.
 
 ### 3. Запуск
-1. **Qdrant:** `.\run_qdrant.bat`
+1. **Qdrant:** `.\run_qdrant.bat` — Docker-first; если Docker недоступен (или `$use_portable_qd = 1` в `run_qdrant.ps1`), автоматически скачивается и запускается портативный бинарник из `bin\qd\`. Рантайм также сам поднимает портативный бэкенд, если Qdrant не запущен. Питон-часть не замечает разницы (тот же `http://localhost:6333`, то же хранилище `data\qdrant_storage`).
 2. **Ollama / LLaMA-сервер**
 3. **Приложение:** `.\run_ai_everynyan.bat`
 
@@ -157,7 +157,8 @@ searxng_url: "http://localhost:2597"
 AI_EveryNyan/
 ├── install_ai_everynyan.ps1   # инсталлятор
 ├── run_ai_everynyan.bat
-├── run_qdrant.bat
+├── run_qdrant.bat               # обёртка (вся логика в run_qdrant.ps1)
+├── run_qdrant.ps1               # лаунчер Qdrant: Docker-first, портативный фолбэк в bin\qd
 ├── src/
 │   ├── main.py                # v0.16.2: MCP агент, цветное логирование, fallback
 │   ├── memory_manager.py      # v0.7.0: JSON-метаданные, циркумплексная модель

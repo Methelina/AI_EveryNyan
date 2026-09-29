@@ -7,10 +7,16 @@
     Идемпотентен: безопасен для повторного запуска.
 
     \install_ai_everynyan.ps1
-    Version: 0.8.1
+    Version: 0.8.2
     Author: Soror L.'.L.'.
-    Updated: 2026-05-02
+    Updated: 2026-09-29
 #>
+
+# Patchnote v0.8.2:
+#   [+] Установка портативного Qdrant (bin\qd) стала обязательным шагом [2b/8]:
+#       скачивание с GitHub releases (v1.19.1) + распаковка, идемпотентно
+#   [*] Docker больше не обязательная зависимость: при отсутствии выводится
+#       предупреждение с указанием на портативный фолбэк run_qdrant.ps1 (bin\qd)
 
 # Patchnote v0.8.1:
 #   [+] Добавлен флаг --no-warn-script-location для pip install (убирает ложные warning)
@@ -248,22 +254,68 @@ if (!(Test-Command "conda")) { $Missing += "Conda (Miniforge/Anaconda)" }
 if (!(Test-Command "docker")) { $Missing += "Docker" }
 if (!(Test-Command "ollama")) { $Missing += "Ollama" }
 
+# Docker опционален: Qdrant может работать через портативный бинарник (bin\qd).
+$DockerMissing = $Missing -contains "Docker"
+if ($DockerMissing) { $Missing = $Missing | Where-Object { $_ -ne "Docker" } }
+
 if ($Missing.Count -gt 0) {
     Write-Status "ОШИБКА: Отсутствуют: $($Missing -join ', ')" "ERROR"
     Read-Host "Нажмите Enter для выхода"
     exit 1
 }
-Write-Status "  [+] Git, Conda, Docker, Ollama найдены" "SUCCESS"
+Write-Status "  [+] Git, Conda, Ollama найдены" "SUCCESS"
+if ($DockerMissing) {
+    Write-Status "  [WARN] Docker не найден - Qdrant будет запускаться в портативном режиме (bin\qd) через run_qdrant.bat" "WARN"
+} else {
+    Write-Status "  [+] Docker найден" "SUCCESS"
+}
 
 # 2. Создание структуры папок
 Write-Status "`n[2/8] Создание структуры проекта..." "INFO"
-$Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage", $PlaywrightBrowsersPath)
+$Dirs = @($SrcPath, $ConfigPath, $DataPath, $LogsPath, $CachePath, $TempPath, "$DataPath\qdrant_storage", $PlaywrightBrowsersPath, "bin\qd")
 foreach ($dir in $Dirs) {
     if (!(Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 }
 Write-Status "  [+] Директории готовы" "SUCCESS"
+
+# 2b. Портативный Qdrant (bin\qd) - обязательный компонент.
+# Даже при наличии Docker портативный бинарник ставим всегда: это гарантированный
+# фолбэк-бэкенд для run_qdrant.ps1 и для авто-подъёма в src\qdrant_backend.py
+# (одинаковый API и data\qdrant_storage, Python-часть бекенд не различает).
+Write-Status "`n[2b/8] Установка портативного Qdrant (bin\qd)..." "INFO"
+$QdBinDir    = "bin\qd"
+$QdExe       = Join-Path $QdBinDir "qdrant.exe"
+$QdZipUrl    = "https://github.com/qdrant/qdrant/releases/download/v1.19.1/qdrant-x86_64-pc-windows-msvc.zip"
+$QdZipFile   = Join-Path $QdBinDir "qdrant.zip"
+
+if (Test-Path $QdExe) {
+    Write-Status "  [+] qdrant.exe уже установлен в $QdBinDir" "SUCCESS"
+} else {
+    Write-Status "  Скачивание qdrant v1.19.1 (x86_64-pc-windows-msvc)..." "INFO"
+    $qdOk = Invoke-WithRetry -Script {
+        Invoke-WebRequest -Uri $QdZipUrl -OutFile $QdZipFile -UseBasicParsing
+        if (!(Test-Path $QdZipFile)) { throw "download failed" }
+    } -MaxAttempts 3 -DelaySec 10
+
+    if ($qdOk) {
+        Write-Status "  Распаковка в $QdBinDir ..." "INFO"
+        try {
+            Expand-Archive -Path $QdZipFile -DestinationPath $QdBinDir -Force
+            Remove-Item $QdZipFile -Force -ErrorAction SilentlyContinue
+            if (Test-Path $QdExe) {
+                Write-Status "  [+] Портативный Qdrant установлен" "SUCCESS"
+            } else {
+                Write-Status "  [!] qdrant.exe не найден после распаковки" "WARN"
+            }
+        } catch {
+            Write-Status "  [!] Ошибка распаковки: $($_.Exception.Message)" "WARN"
+        }
+    } else {
+        Write-Status "  [!] Не удалось скачать Qdrant. Запустите run_qdrant.bat позже - он докачает автоматически." "WARN"
+    }
+}
 
 # 3. Генерация конфигурации (новый полный шаблон)
 Write-Status "`n[3/8] Подготовка конфигурации..." "INFO"

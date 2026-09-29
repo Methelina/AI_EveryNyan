@@ -4,9 +4,20 @@ Holds all mutable global state (settings, LLM, vector store, etc.).
 Provides component initialization, embedding/LLM reinit, and MCP agent setup.
 
 /src/runtime.py
-Version:     0.17.7
+Version:     0.17.9
 Author:      Soror L.'.L.'.
-Updated:     2026-05-05
+Updated:     2026-09-29
+
+Patch Notes v0.17.9 (Soror L'.L'.):
+  [+] init_components(): Qdrant warm-up via qdrant_backend.ensure_qdrant()
+      (probe /readyz, auto-spawn portable bin\qd fallback, loud failure message).
+
+Patch Notes v0.17.8 (Soror L'.L'.):
+  [+] init_mcp_agent(): SearXNG warm-up probe (mcp_health.probe_searxng).
+      If unreachable: loud [MCP] fallback warning + remedy hint, and the
+      SearXNG-dependent tool (web_search) is dropped from the react agent so a
+      dead backend never pollutes the LLM prompt. fetch_url stays (it does not
+      need the SearXNG container).
 
 Patch Notes v0.17.7 (by pytraveler):
   [+] comfyui_daemon: global reference to ComfyUIDaemon instance.
@@ -35,6 +46,7 @@ from qdrant_client import QdrantClient, models
 from config import AppSettings
 from llm_adapter import LlamaChatModel
 from memory_manager import MemoryManager
+from qdrant_backend import abort_start, ensure_qdrant
 from query_preprocessor import QueryPreprocessor
 
 
@@ -115,6 +127,12 @@ def init_components():
 
     logger.info(f"Chat mode: {settings.chat_mode}, endpoint: {chat_cfg.base_url}, model: {chat_cfg.chat_model}")
     logger.info(f"Embedding mode: {settings.embedding_mode}, endpoint: {embed_cfg.base_url}, model: {embed_cfg.embedding_model}")
+
+    # Warm-up: guarantee a reachable Qdrant before touching the client.
+    # If the URL is silent, qdrant_backend spawns the portable bin\qd\qdrant.exe
+    # against the shared storage; failure exits with a clear remedy message.
+    if not ensure_qdrant(settings.vector_db.url):
+        abort_start()
 
     qdrant_client = QdrantClient(url=settings.vector_db.url)
     if not qdrant_client.collection_exists(settings.vector_db.collection):
@@ -199,7 +217,31 @@ async def init_mcp_agent():
         searxng_url = getattr(settings, "searxng_url", "http://localhost:2597")
         mcp_client = return_mcp_client(SEARXNG_URL=searxng_url)
 
+        # Warm-up probe: the FastMCP stdio subprocess always starts and always
+        # advertises its tools, so discovery alone proves nothing about SearXNG.
+        # If the meta-search engine is unreachable, drop the SearXNG-dependent
+        # tool (web_search) from the agent - a dead backend must not pollute the
+        # LLM prompt - and warn loudly with the remedy (fail soft, log loud).
+        # fetch_url stays: it fetches URLs directly and needs no SearXNG container.
+        from mcp_health import probe_searxng
+        searxng_ok = probe_searxng(searxng_url)
+        if not searxng_ok:
+            logger.warning(
+                "[MCP] fallback: SearXNG at %s is unreachable - web_search "
+                "disabled for this session. Remedy: run .\\run_searxng.bat",
+                searxng_url,
+            )
+            add_ai_thought(
+                "[MCP] SearXNG offline - web search disabled (run .\\run_searxng.bat)",
+                (255, 180, 80),
+            )
+
         raw_tools = await mcp_client.get_tools()
+        if raw_tools and not searxng_ok:
+            dropped = [t.name for t in raw_tools if t.name == "web_search"]
+            raw_tools = [t for t in raw_tools if t.name != "web_search"]
+            if dropped:
+                logger.info("[MCP] Disabled tool(s) (backend unreachable): %s", ", ".join(dropped))
         if raw_tools:
             def unwrap_tool(original_tool):
                 async def _wrapper(**kwargs):
