@@ -20,6 +20,7 @@ playwright_browsers/
 logs/
 hf_cache/
 temp/
+bin/qd/
 
 # === Configs & Secrets ===
 config/settings.yaml
