@@ -57,3 +57,4 @@ Pillow>=10.0.0              # image validation, sanitization, resizing, PNG conv
 #   [+] Added Pillow for multimodal vision tool (describe_image).
 # Testing
 pytest>=8.0
+psutil>=5.9

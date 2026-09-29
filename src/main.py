@@ -367,8 +367,11 @@ def main():
     init_query_preprocessor()
 
     from comfyui_monitor import ComfyUIDaemon
+    from comfyui_discovery import resolve_comfyui_server
+
+    resolved_server = resolve_comfyui_server(runtime.settings.comfyui.server)
     runtime.comfyui_daemon = ComfyUIDaemon(
-        server=runtime.settings.comfyui.server,
+        server=resolved_server,
         check_interval=runtime.settings.comfyui.daemon_check_interval,
     )
     runtime.comfyui_daemon.start()

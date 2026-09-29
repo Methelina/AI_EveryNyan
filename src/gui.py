@@ -3,9 +3,15 @@ DearPyGui GUI setup, control panel callbacks, AI thoughts display, and splitter 
 Handles viewport, theming, chat rendering, model selection, and runtime parameter controls.
 
 /src/gui.py
-Version:     0.17.8
+Version:     0.17.9
 Author:      Soror L.'.L.'.
-Updated:     2026-05-05
+Updated:     2026-09-29
+
+Patch Notes v0.17.9 (Soror L'.L'.):
+  [*] ComfyUI monitor logging: the 30s INFO heartbeat spammed identical state
+      while ComfyUI was offline. Now the heartbeat is debug-level, and a loud
+      INFO line is emitted only on connection TRANSITIONS (online/offline),
+      once per change.
 
 Patch Notes v0.17.8 (by pytraveler):
   [+] ComfyUI Monitor integration: real-time preview panel, progress bar, and
@@ -662,6 +668,7 @@ _comfyui_suppress_logged: bool = False  # one-shot: log when UI suppressed durin
 _comfyui_last_prompt_id: Optional[str] = None  # track daemon prompt_id for new-gen detection
 _comfyui_heartbeat: float = 0.0  # last heartbeat log timestamp
 _comfyui_tick_count: int = 0  # total monitor ticks (diagnostic)
+_comfyui_last_connected: Optional[bool] = None  # connection transition tracking (None = first tick)
 _comfyui_watchdog_stop: threading.Event = threading.Event()  # signal watchdog to stop
 
 
@@ -787,7 +794,7 @@ def _update_comfyui_monitor():
     global _comfyui_last_progress, _comfyui_stall_since
     global _comfyui_force_hidden, _comfyui_prev_generating
     global _comfyui_suppress_logged, _comfyui_last_prompt_id
-    global _comfyui_heartbeat, _comfyui_tick_count
+    global _comfyui_heartbeat, _comfyui_tick_count, _comfyui_last_connected
     try:
         daemon = runtime.comfyui_daemon
         if daemon is None:
@@ -801,19 +808,27 @@ def _update_comfyui_monitor():
 
         state = daemon.get_state()
 
-        # Periodic heartbeat (every 30s) to confirm monitor is alive
-        if now - _comfyui_heartbeat > 30.0:
+        # Connection transitions: log once per change, loud; steady state is
+        # silent (periodic checks stay at debug level - no heartbeat spam).
+        connected = state["connected"]
+        if connected != _comfyui_last_connected:
+            _comfyui_last_connected = connected
+            if connected:
+                logger.info(f"[ComfyUI Monitor] Connection: ONLINE ({daemon.server})")
+            else:
+                logger.warning("[ComfyUI Monitor] Connection: OFFLINE - start ComfyUI to enable image generation")
+        elif now - _comfyui_heartbeat > 30.0:
             _comfyui_heartbeat = now
-            logger.info(
+            logger.debug(
                 f"[ComfyUI Monitor] heartbeat #{_comfyui_tick_count}: "
                 f"generating={state['generating']}, visible={_comfyui_visible}, "
                 f"force_hidden={_comfyui_force_hidden}, prev_gen={_comfyui_prev_generating}, "
-                f"prompt_id={state.get('prompt_id')}, connected={state['connected']}"
+                f"prompt_id={state.get('prompt_id')}, connected={connected}"
             )
 
         # Connection status indicator
-        conn_label = "ComfyUI: Connected" if state["connected"] else "ComfyUI: Disconnected"
-        conn_color = (100, 255, 100) if state["connected"] else (200, 100, 100)
+        conn_label = "ComfyUI: Connected" if connected else "ComfyUI: Disconnected"
+        conn_color = (100, 255, 100) if connected else (200, 100, 100)
         try:
             if dpg.does_item_exist("comfyui_conn_text"):
                 dpg.set_value("comfyui_conn_text", conn_label)

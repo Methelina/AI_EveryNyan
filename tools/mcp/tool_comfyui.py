@@ -40,6 +40,11 @@ from fastmcp import FastMCP
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CONFIG_PATH = REPO_ROOT / "config" / "settings.yaml"
 
+# ComfyUI server resolution (config-first + process auto-discovery) lives in
+# src\comfyui_discovery.py - share it instead of duplicating the heuristic.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from comfyui_discovery import resolve_comfyui_server  # noqa: E402
+
 LOG_DIR = REPO_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DEBUG_LOG = LOG_DIR / "mcp_comfyui.log"
@@ -84,6 +89,8 @@ def _load_settings() -> dict:
 
 
 _yaml_settings = _load_settings()
+# Config-first + auto-discovery fallback (shared with the monitor daemon).
+_yaml_settings["server"] = resolve_comfyui_server(_yaml_settings["server"])
 
 COMFYUI_SERVER = os.environ.get("COMFYUI_SERVER", _yaml_settings["server"])
 WORKFLOW_DIR = Path(os.environ.get("COMFYUI_WORKFLOW_DIR", _yaml_settings["workflow_dir"]))
