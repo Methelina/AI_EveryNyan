@@ -1,8 +1,13 @@
 :: ==========================================
-:: SearXNG Launcher v1.0.4 - AI_EveryNyan
-:: Version: 1.0.4
+:: SearXNG Launcher v1.0.5 - AI_EveryNyan
+:: Version: 1.0.5
 :: Author: Soror L.'.L.'. (Linda)
-:: Updated: 2026-04-23
+:: Updated: 2026-09-29
+::
+:: Patchnote v1.0.5:
+::   [+] Восстановление settings.yml из config\searxng_settings.reference.yml
+::       при его отсутствии (вайп/пересоздание конфига) - настройки движков
+::       (google disabled и пр.) больше не сгорают молча.
 ::
 :: Patchnote v1.0.4:
 ::   [FIX] Все команды в одну строку (убраны ^, т.к. ломали парсинг)
@@ -304,6 +309,20 @@ echo [WARN] Timeout waiting for healthz, but continuing...
 
 :: === ПАТЧ ПОСЛЕ ПЕРВОГО ЗАПУСКА (только сетевые параметры, с маркером) ===
 :ready
+:: Восстановление настроек из референсной копии, если конфиг утерян (вайп).
+if not exist "%SEARXNG_DATA%\settings.yml" (
+    if exist "%ROOT%config\searxng_settings.reference.yml" (
+        call :log "settings.yml missing - restoring from config\searxng_settings.reference.yml"
+        echo [INFO] settings.yml not found - restoring from reference copy...
+        copy /y "%ROOT%config\searxng_settings.reference.yml" "%SEARXNG_DATA%\settings.yml" >nul
+        call :log "Restarting container to load restored settings"
+        docker restart %CONTAINER_NAME% >nul 2>&1
+        timeout /t 3 /nobreak >nul
+    ) else (
+        call :log "settings.yml missing, no reference copy - SearXNG will generate defaults"
+    )
+)
+
 if exist "%SEARXNG_DATA%\settings.yml" (
     call :log "Checking for post-start network patches"
     
