@@ -21,6 +21,8 @@ logs/
 hf_cache/
 temp/
 bin/qd/
+bin/kilo/
+tmp/
 
 # === Configs & Secrets ===
 config/settings.yaml

@@ -1,10 +1,15 @@
 <#
 .SYNOPSIS
     AI_EveryNyan Chat Launcher by L.'.L.'.
-    Version: 1.4.0
-    Updated: 2026-09-29
+    Version: 1.5.0
+    Updated: 2026-09-30
 
 .DESCRIPTION
+    Patchnote v1.5.0:
+      [+] Persona selection menu before python launch: scans
+          config\character\base*.yaml, sets AI_EVERYNYAN_PERSONA env for the
+          runtime; Enter = default persona. Skipped when the env var is
+          already set. Persona keys all memory stores (per-persona DB).
     Patchnote v1.4.0:
       [+] Убийство зомби-процессов AI_EveryNyan (python.exe из project-local
           env) при старте лаунчера, до проверки сервисов.
@@ -30,7 +35,7 @@ Write-Host @"
       ░  ░  ░    ░      ░  ░  ░    ░
   ===========================================
     AI_EveryNyan Chat Launcher by L.'.L.'.
-    Version: 1.4.0
+    Version: 1.5.0
   ===========================================
 
 "@
@@ -87,6 +92,41 @@ if ($zombiePids.Count -gt 0) {
 } else {
     Write-Host "[RUNNER] [INFO] No zombie AI_EveryNyan processes found."
 }
+
+# ===== Выбор персоны (до загрузки питона) =====
+# Персона определяет хранилища памяти: data/memory/<persona>/history.db,
+# data/memory/<persona>/diary и коллекцию Qdrant everynyan_diary__<persona>
+# (персона по умолчанию EveryNyan keeps the legacy names). Переключение
+# персоны = перезапуск лаунчера; внутри сессии персоны не меняются.
+$charDir = Join-Path $CONFIG "character"
+$personaFiles = @(Get-ChildItem -Path $charDir -Filter "base*.yaml" -File -ErrorAction SilentlyContinue)
+$personas = New-Object System.Collections.Generic.List[string]
+foreach ($pf in $personaFiles) {
+    $pn = (Select-String -Path $pf.FullName -Pattern '^\s*persona_name:\s*["'']?([A-Za-z0-9_-]+)' -ErrorAction SilentlyContinue |
+           Select-Object -First 1).Matches.Groups[1].Value
+    if ($pn -and $personas -notcontains $pn) { [void]$personas.Add($pn) }
+}
+if ($personas.Count -eq 0) { [void]$personas.Add("EveryNyan") }
+
+if ($env:AI_EVERYNYAN_PERSONA) {
+    Write-Host "[RUNNER] [INFO] Persona from environment: $env:AI_EVERYNYAN_PERSONA"
+} else {
+Write-Host ""
+Write-Host "[RUNNER] Select persona:" -ForegroundColor Cyan
+for ($i = 0; $i -lt $personas.Count; $i++) {
+    $mark = if ($personas[$i] -eq "EveryNyan") { " (default)" } else { "" }
+    Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $personas[$i], $mark)
+}
+Write-Host "  [Enter] default: $($personas[0])"
+$sel = Read-Host "Persona number"
+$chosen = $null
+if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $personas.Count) {
+    $chosen = $personas[[int]$sel - 1]
+}
+if (-not $chosen) { $chosen = $personas[0] }
+$env:AI_EVERYNYAN_PERSONA = $chosen
+}
+Write-Host "[RUNNER] [INFO] Active persona: $env:AI_EVERYNYAN_PERSONA" -ForegroundColor Green
 
 # ===== Парсинг settings.yaml =====
 $yaml = Get-Content $CONFIG_FILE -Encoding UTF8

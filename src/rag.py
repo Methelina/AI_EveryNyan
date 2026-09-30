@@ -156,7 +156,7 @@ async def check_plagiarism(text: str, threshold: float) -> bool:
     try:
         query_vector = await runtime.embeddings.aembed_query(text)
         results = runtime.qdrant_client.query_points(
-            collection_name=runtime.settings.vector_db.collection,
+                        collection_name=runtime.persona_collection(),
             query=query_vector,
             limit=1,
             with_payload=False,

@@ -1,11 +1,11 @@
-# 🐱 AI_EveryNyan v0.16.2 — Smart Desktop Assistant with Hybrid Memory & MCP Tools
+# 🐱 AI_EveryNyan v0.18.0 — Smart Desktop Assistant with Hybrid Memory & MCP Tools
 
 > *"Haru, everynyan! How are you!? Fine, thank you! I wish I were a bird!"*
 
 **AI_EveryNyan** is a desktop AI application with an advanced memory architecture and support for external tools via MCP (Model Context Protocol). Unlike ordinary chatbots, EveryNyan keeps a "digital diary", summarizes conversations, can search the web (through SearXNG) and extract content from web pages.
 
 The application is built on Python, uses local models (Ollama, a LLaMA server, or **any OpenAI-compatible API**) and a hybrid storage system: **DuckDB** for exact history and **Qdrant** for semantic associations.
-**Current version:** v0.16.2 — with fully unified multi-backend support (Ollama / LLaMA / OpenAI-compatible), streaming responses, an MCP agent, colored logging of tool calls, and self-healing backends (Qdrant, SearXNG, ComfyUI).
+**Current version:** v0.18.0 — with a persona system (per-character memory stores), a redesigned tabbed GUI (VHS font set, drop-cap avatars), multi-backend support (Ollama / LLaMA / OpenAI-compatible), streaming responses, an MCP agent, and self-healing backends (Qdrant, SearXNG, ComfyUI).
 
 ---
 
@@ -15,6 +15,18 @@ The application is built on Python, uses local models (Ollama, a LLaMA server, o
 Storage is split into two levels:
 *   **DuckDB (SQL):** Structured chat chronology, diary entries, and exact metadata.
 *   **Qdrant (Vector DB):** Embeddings of dialogues and thoughts. Provides RAG (Retrieval-Augmented Generation) — search by meaning.
+
+### 👤 Persona System & Per-Character Memory
+Each persona owns an isolated memory store, selected in the launcher **before** Python starts:
+*   **DuckDB:** `data/memory/<Persona>/history.db` — chat history and diary summaries.
+*   **Qdrant collection:** `everynyan_diary__<Persona>` (the default persona **EveryNyan** keeps the legacy `everynyan_diary` name).
+*   **Diary files:** `data/memory/<Persona>/diary/`.
+The persona is passed to the runtime via the `AI_EVERYNYAN_PERSONA` environment variable and resolved before any init — no hot-swapping of open databases. Switching a persona means restarting the launcher and picking another entry; inside a session the GUI switches only appearance sets (skins), which never touch memory.
+A one-time migration script (`scripts/migrate_memory_to_persona.py`, idempotent, with a backup into `temp/backup/`) moves the legacy shared `data/history.db` into `data/memory/EveryNyan/`.
+Persona identity itself lives in `config/character/base.yaml` (`meta.persona_name`); an appearance set can optionally override the persona prompt with `base_<AppearanceSet>.yaml` — while `persona_name` stays the same, the memory impact is zero.
+
+### 🖥️ Redesigned Tabbed GUI
+The window is split into three tabs — **CHAT** (chat + input), **CONSOLE** (`[SYSTEM] LOG`), **SETTINGS** — with the CrisTical dark palette (amber accents), a VHS font set (ModeSeven headers, ModeSeven body, VCR OSD Mono RUS for chat), uppercase section headers, and **drop-cap avatars**: when `config/character/ava_<AppearanceSet>.png` exists, the image sits beside the message like an initial, with the first four text lines running next to it and the rest flowing full-width below.
 
 ### ⏳ Sliding Window & Smart Dump
 A unique context management algorithm:
@@ -177,7 +189,7 @@ searxng_fallback_urls: []   # empty -> built-in verified public instances
 1. **Qdrant:** `.\run_qdrant.bat` — Docker-first; if Docker is unavailable (or `$use_portable_qd = 1` in `run_qdrant.ps1`), the portable binary is auto-downloaded and started from `bin\qd\`. The runtime also self-starts the portable backend if Qdrant was not launched. The Python side does not notice the difference (the same `http://localhost:6333`, the same storage `data\qdrant_storage`).
 2. **SearXNG (for web search):** `.\run_searxng.bat` — if the container is not up, the runtime falls back to verified public instances (probed via headless browser); if those are dead too, `web_search` is excluded from the MCP agent with a warning (fetch_url works without it).
 3. **Ollama / LLaMA-server / OpenAI-compatible endpoint** — the launcher also pings the selected `chat_model` and warns if it is dead or rate-limited before the app starts.
-4. **Application:** `.\run_ai_everynyan.bat`
+4. **Application:** `.\run_ai_everynyan.bat` — the launcher shows a **persona selection menu** (Enter = default persona) right after the banner and preflight checks, before Python starts; then it pings the selected `chat_model` and kills leftover zombie instances from previous runs.
 
 ---
 
@@ -190,14 +202,16 @@ AI_EveryNyan/
 ├── run_qdrant.bat               # wrapper (logic lives in run_qdrant.ps1)
 ├── run_qdrant.ps1               # Qdrant launcher: Docker-first, portable fallback in bin\qd
 ├── src/
-│   ├── main.py                # v0.17.10: MCP agent, colored logging, error handling, retry ladder
-│   ├── runtime.py             # v0.17.11: runtime state, Qdrant/SearXNG warmup, chat modes, cooldown
+│   ├── main.py                # v0.18.0: persona resolution, MCP agent, error handling, retry ladder
+│   ├── runtime.py             # v0.18.x: runtime state, persona-scoped memory paths, Qdrant warmup
 │   ├── qdrant_backend.py      # v1.0.1: auto-start portable Qdrant (bin\qd)
 │   ├── mcp_health.py          # v1.1.0: SearXNG fallback resolver (nodriver probes, health cache)
-│   ├── comfyui_discovery.py   # v1.0.0: ComfyUI server auto-discovery (process scan)
+│   ├── comfyui_discovery.py   # v1.1.0: ComfyUI server auto-discovery (process scan, IPv4+IPv6)
 │   ├── browser_updater.py     # v1.0.0: Chromium auto-update (pip + smoke test + prune)
 │   ├── memory_manager.py      # v0.7.1: JSON metadata, circumplex model, timestamp helper
 │   └── query_preprocessor.py  # v0.2.0: lemmatization
+├── scripts/
+│   └── migrate_memory_to_persona.py  # one-time legacy DB migration (idempotent, backs up first)
 ├── tools/mcp/
 │   ├── __init__.py             # auto-discovery of tool_*.py, MultiServerMCPClient
 │   ├── tool_searxng.py         # v0.6.0: SearXNG + fetch_url (chunked output, nodriver routing)
@@ -207,10 +221,15 @@ AI_EveryNyan/
 │   ├── settings.yaml
 │   ├── searxng_settings.reference.yml  # tracked reference of tuned SearXNG engines
 │   └── character/
-│       ├── base.yaml
-│       └── appearance.yaml
+│       ├── base.yaml           # shared persona base (meta.persona_name)
+│       ├── base_<Set>.yaml     # optional per-appearance persona prompt override
+│       ├── appearance.yaml
+│       ├── appearance_<Set>.json
+│       └── ava_<Set>.png       # drop-cap chat avatar for the appearance set
 ├── tests/                      # 58 unit tests (backends, probes, chunking, config)
-├── data/ (history.db, qdrant_storage)
+├── data/
+│   ├── memory/<Persona>/       # per-persona store: history.db + diary/
+│   └── qdrant_storage
 └── logs/
 ```
 
@@ -221,7 +240,7 @@ AI_EveryNyan/
 ### 1. Asynchronous Architecture
 GUI (DearPyGui) on the main thread, LLM requests and RAG on a background `asyncio` loop.
 
-### 2. Message Pipeline (v0.16.2)
+### 2. Message Pipeline (v0.18.0)
 1.  **Anti-Repeat** — check for semantic loops.
 2.  **RAG** — search in Qdrant (with similarity threshold).
 3.  **Keyword search fallback** — if no vectors, search in DuckDB.
@@ -265,7 +284,7 @@ GUI (DearPyGui) on the main thread, LLM requests and RAG on a background `asynci
 
 ---
 
-## 🗺️ Roadmap Milestones (up to v0.16.2)
+## 🗺️ Roadmap Milestones (up to v0.18.0)
 
 ### Already Implemented
 - ✅ Full dual-backend support (Ollama + LLaMA) via a unified LangChain interface.
@@ -296,6 +315,11 @@ GUI (DearPyGui) on the main thread, LLM requests and RAG on a background `asynci
 - ✅ **Chromium auto-update** — PyPI check at startup (config-gated), visible download progress, smoke test, stale-revision pruning.
 - ✅ **Copyable chat** — double-click a message to copy it.
 - ✅ **Launcher model ping** — the preflight warns if the selected `chat_model` is dead or rate-limited before the app starts.
+- ✅ **Persona system** — persona chosen in the launcher menu before Python starts; per-persona DuckDB (`data/memory/<Persona>/history.db`), diary and Qdrant collection; one-time idempotent migration of the legacy store.
+- ✅ **Per-appearance persona overrides** — `base_<Set>.yaml` prompt overrides with shared-memory safety while `persona_name` is unchanged.
+- ✅ **Redesigned GUI** — CHAT / CONSOLE / SETTINGS tabs, CrisTical dark palette, VHS font set (ModeSeven / VCR OSD Mono RUS), drop-cap image avatars (`ava_<Set>.png`).
+- ✅ **Launcher zombie guard** — leftover instances of the app (matched by project-env executable path or console title) are killed before startup.
+- ✅ **ComfyUI dual-stack discovery** — auto-discovery probes both 127.0.0.1 and [::1] (survives `--listen` binding to IPv6-only).
 
 ### In Active Development (WIP)
 - 🚧 **Internal thoughts (proactivity)** — periodic generation of random thoughts saved to the diary.

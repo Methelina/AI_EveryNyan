@@ -61,6 +61,7 @@ Patch Notes v0.17.6 (by pytraveler):
 """
 
 import sys
+import os
 import re
 import asyncio
 import logging
@@ -453,9 +454,13 @@ def signal_handler(signum, frame):
 # ============================================================================
 
 def main():
+    # Persona comes from the launcher (menu choice) via env; default EveryNyan.
+    runtime.set_active_persona(os.environ.get("AI_EVERYNYAN_PERSONA"))
+    logger.info(f"[APP] Active persona: {runtime.active_persona}")
+
     config_path = Path("config/settings.yaml")
     runtime.settings = AppSettings.from_yaml(str(config_path))
-    Path(runtime.settings.diary.storage_dir).mkdir(parents=True, exist_ok=True)
+    Path(runtime.persona_diary_dir()).mkdir(parents=True, exist_ok=True)
     Path("logs").mkdir(parents=True, exist_ok=True)
     Path("hf_cache").mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(parents=True, exist_ok=True)

@@ -93,6 +93,47 @@ session_context: List[Dict[str, str]] = []
 anti_repeat_cache: List[Dict[str, Any]] = []
 
 # ============================================================================
+# Active persona (set by main.py from the launcher, before any init)
+# ============================================================================
+active_persona: str = "EveryNyan"
+DEFAULT_PERSONA = "EveryNyan"
+
+
+def set_active_persona(name: Optional[str]) -> str:
+    """Set and sanitize the active persona name (launcher choice).
+
+    The name keys ALL persona-scoped storage: DuckDB path, diary dir and the
+    Qdrant collection. The default persona keeps the legacy store names
+    (data/history.db layout moved to data/memory/EveryNyan by the migration
+    script, collection everynyan_diary as-is), any other persona gets
+    canonical suffixed names.
+    """
+    global active_persona
+    import re as _re
+    clean = _re.sub(r"[^A-Za-z0-9_-]", "_", (name or "").strip()) or DEFAULT_PERSONA
+    active_persona = clean
+    return clean
+
+
+def persona_memory_dir() -> str:
+    return f"data/memory/{active_persona}"
+
+
+def persona_db_path() -> str:
+    return f"data/memory/{active_persona}/history.db"
+
+
+def persona_diary_dir() -> str:
+    return f"data/memory/{active_persona}/diary"
+
+
+def persona_collection() -> str:
+    if active_persona == DEFAULT_PERSONA:
+        return settings.vector_db.collection
+    return f"{settings.vector_db.collection}__{active_persona}"
+
+
+# ============================================================================
 # Async infrastructure
 # ============================================================================
 async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -151,14 +192,15 @@ def init_components():
         abort_start()
 
     qdrant_client = QdrantClient(url=settings.vector_db.url)
-    if not qdrant_client.collection_exists(settings.vector_db.collection):
+    _collection = persona_collection()
+    if not qdrant_client.collection_exists(_collection):
         qdrant_client.create_collection(
-            collection_name=settings.vector_db.collection,
+            collection_name=_collection,
             vectors_config=models.VectorParams(
                 size=settings.vector_db.embedding_dim, distance=models.Distance.COSINE
             ),
         )
-        logger.info(f"Created collection: {settings.vector_db.collection}")
+        logger.info(f"Created collection: {_collection}")
 
     embeddings = OpenAIEmbeddings(
         model=embed_cfg.embedding_model,
@@ -169,7 +211,7 @@ def init_components():
 
     vector_store = QdrantVectorStore(
         client=qdrant_client,
-        collection_name=settings.vector_db.collection,
+        collection_name=_collection,
         embedding=embeddings
     )
 
@@ -202,10 +244,10 @@ def init_components():
 
 def init_memory_manager():
     global memory_manager
-    memory_manager = MemoryManager()
+    memory_manager = MemoryManager(db_path=persona_db_path())
     stats = memory_manager.get_stats()
     logger.info(
-        f"MemoryManager initialized. Messages: {stats.get('total_messages', 0)}"
+        f"MemoryManager initialized. Persona: {active_persona}, Messages: {stats.get('total_messages', 0)}"
     )
 
 
@@ -493,7 +535,7 @@ def reinit_embeddings():
         )
     vector_store = QdrantVectorStore(
         client=qdrant_client,
-        collection_name=settings.vector_db.collection,
+        collection_name=persona_collection(),
         embedding=embeddings
     )
     logger.info("Embeddings and vector store reinitialized")
